@@ -1,0 +1,108 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Global reset & base ─────────────────────────────────────────── */
+:root {
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+}
+
+* {
+  box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  overflow-x: hidden;
+}
+
+body {
+  background-color: #0c3577;
+  color: #F8FAFC;
+  font-family: 'Inter', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  overscroll-behavior: none;
+}
+
+/* ── Ludo King Authentic Royal Blue Pattern ─────────────────────── */
+.ludo-king-bg {
+  background-color: #0a3070;
+  background-image: 
+    radial-gradient(circle at 50% 50%, rgba(21, 92, 199, 0.65) 0%, rgba(7, 30, 72, 0.95) 100%),
+    repeating-linear-gradient(45deg, rgba(255, 255, 255, 0.035) 0, rgba(255, 255, 255, 0.035) 28px, transparent 28px, transparent 56px),
+    repeating-linear-gradient(-45deg, rgba(0, 0, 0, 0.18) 0, rgba(0, 0, 0, 0.18) 28px, transparent 28px, transparent 56px);
+}
+
+/* ── Safe area utilities ─────────────────────────────────────────── */
+.pb-safe { padding-bottom: max(1rem, var(--safe-bottom)); }
+.pt-safe { padding-top: max(0px, var(--safe-top)); }
+
+/* ── Scrollbar styling ───────────────────────────────────────────── */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(99,102,241,0.3); border-radius: 9999px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(99,102,241,0.6); }
+
+/* ── Focus ring ──────────────────────────────────────────────────── */
+:focus-visible {
+  outline: 2px solid #6366F1;
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* ── Reduced motion ──────────────────────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ── Custom utilities ────────────────────────────────────────────── */
+@keyframes tokenHopArc {
+  0% {
+    transform: translateY(0px) scale(1, 1);
+  }
+  35% {
+    transform: translateY(-22px) scale(0.92, 1.25);
+  }
+  75% {
+    transform: translateY(-2px) scale(1.15, 0.9);
+  }
+  100% {
+    transform: translateY(0px) scale(1, 1);
+  }
+}
+
+.animate-token-hop {
+  animation: tokenHopArc 240ms cubic-bezier(0.25, 1, 0.5, 1);
+}
+
+input {
+  background-color: #131A29 !important;
+  color: #F8FAFC !important;
+}
+
+input:-webkit-autofill,
+input:-webkit-autofill:hover, 
+input:-webkit-autofill:focus {
+  -webkit-text-fill-color: #F8FAFC !important;
+  -webkit-box-shadow: 0 0 0px 1000px #131A29 inset !important;
+  transition: background-color 5000s ease-in-out 0s;
+}
+
+@layer utilities {
+  .border-subtle { border-color: rgba(99,102,241,0.18); }
+  .bg-surface { background-color: rgba(18,24,38,0.88); }
+  .bg-elevated { background-color: rgba(28,38,58,0.97); }
+  .text-muted { color: #94A3B8; }
+  .glow-primary { box-shadow: 0 0 20px rgba(99,102,241,0.35); }
+  .glow-gold { box-shadow: 0 0 20px rgba(245,158,11,0.45); }
+  .min-touch { min-height: 44px; min-width: 44px; }
+}
