@@ -13,7 +13,6 @@ COPY client/package.json ./client/
 RUN npm ci
 
 # Copy source code
-COPY tsconfig.json ./
 COPY shared ./shared
 COPY server ./server
 COPY client ./client
@@ -41,6 +40,6 @@ COPY --from=builder /app/shared/dist ./shared/dist
 COPY --from=builder /app/server/dist ./server/dist
 COPY --from=builder /app/client/dist ./client/dist
 
-EXPOSE 3001
+EXPOSE 3001 10000
 
 CMD ["node", "server/dist/index.js"]
