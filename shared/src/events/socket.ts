@@ -14,12 +14,14 @@ export interface RoomCreatePayload {
   rulePreset?: GameRulePreset;
   targetPlayerCount?: number;
   turnTimeoutSeconds?: number;
+  userId?: string;
 }
 
 export interface RoomJoinPayload {
   roomId: string;
   playerName: string;
   sessionToken?: string;
+  userId?: string;
 }
 
 export interface RoomPlayerReadyPayload {

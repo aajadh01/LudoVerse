@@ -83,6 +83,7 @@ export function registerSocketHandlers(io: LudoServer, roomManager: RoomManager)
         const { room, player } = roomManager.createRoom({
           hostName: data.playerName.trim().slice(0, 24),
           socketId: socket.id,
+          userId: data.userId,
           mode: data.mode,
           rulePreset: data.rulePreset,
           targetPlayerCount: data.targetPlayerCount,
@@ -90,40 +91,9 @@ export function registerSocketHandlers(io: LudoServer, roomManager: RoomManager)
         });
 
         socket.join(room.roomId);
-      socket.join(`player:${player.playerId}`);
         socket.join(`player:${player.playerId}`);
 
-        const gameState: GameState = {
-          roomId: room.roomId,
-          mode: room.mode,
-          rulePreset: room.rulePreset,
-          targetPlayerCount: room.targetPlayerCount,
-          tokensPerPlayer: (room.mode === 'CUSTOM_RADIAL' && room.rulePreset === 'RAPID') ? 2 : 4,
-          status: 'LOBBY',
-          players: [{
-            id: player.playerId,
-            name: player.name,
-            color: 'red',
-            playerIndex: 0,
-            tokens: [],
-            isReady: false,
-            isHost: true,
-            isConnected: true,
-            hasFinished: false,
-          }],
-          activePlayerIndex: 0,
-          currentTurnDice: null,
-          consecutiveSixes: 0,
-          turnPhase: 'WAITING_FOR_ROLL',
-          legalMoveTokenIds: [],
-          captureLedger: [],
-          earlyEndVote: null,
-          turnDeadline: null,
-          matchStartTime: null,
-          matchEndTime: null,
-          winnerPlayerId: null,
-          version: 1,
-        };
+        const gameState: GameState = buildLobbyState(room);
 
         callback?.({ success: true, roomId: room.roomId });
 
@@ -145,6 +115,7 @@ export function registerSocketHandlers(io: LudoServer, roomManager: RoomManager)
         roomId: data.roomId.trim().toUpperCase(),
         playerName: data.playerName.trim().slice(0, 24),
         socketId: socket.id,
+        userId: data.userId,
         sessionToken: data.sessionToken,
       });
 
@@ -168,7 +139,7 @@ export function registerSocketHandlers(io: LudoServer, roomManager: RoomManager)
       socket.join(`player:${player.playerId}`);
       callback?.({ success: true });
 
-      // Deliver the full current game state snapshot for reconnection
+      // Deliver the full authoritative current game state snapshot
       const snapshotState: GameState = room.gameState ?? buildLobbyState(room);
 
       socket.emit('room:joined', {
@@ -178,22 +149,15 @@ export function registerSocketHandlers(io: LudoServer, roomManager: RoomManager)
         gameState: snapshotState,
       });
 
-      if (isReconnect) {
-        // Notify others this player is back
-        socket.to(room.roomId).emit('room:player_joined', {
-          playerId: player.playerId,
-          playerName: player.name,
-          playerColor: room.gameState?.players.find(p => p.id === player.playerId)?.color ?? 'red',
-        });
-        // Send fresh full state to re-hydrate reconnected client
-        broadcastState(room.roomId, snapshotState);
-      } else {
-        socket.to(room.roomId).emit('room:player_joined', {
-          playerId: player.playerId,
-          playerName: player.name,
-          playerColor: 'red',
-        });
-      }
+      // ALWAYS broadcast authoritative full state to all room participants immediately
+      broadcastState(room.roomId, snapshotState);
+
+      // Also emit individual player event for UI toasts/notifications
+      socket.to(room.roomId).emit('room:player_joined', {
+        playerId: player.playerId,
+        playerName: player.name,
+        playerColor: snapshotState.players.find(p => p.id === player.playerId)?.color ?? 'red',
+      });
     });
 
     // ── Room: Ready Toggle ───────────────────────────────────
@@ -538,8 +502,9 @@ export function registerSocketHandlers(io: LudoServer, roomManager: RoomManager)
         }, DISCONNECT_GRACE_MS);
 
         disconnectTimers.set(timerKey, timer);
-      } else if (room.players.filter(p => p.isConnected).length === 0) {
-        // All players disconnected from lobby - room will be cleaned up naturally by TTL
+      } else {
+        // In lobby: broadcast state update so players see presence update immediately
+        broadcastState(room.roomId, buildLobbyState(room));
       }
     });
   });
@@ -550,18 +515,24 @@ export function registerSocketHandlers(io: LudoServer, roomManager: RoomManager)
 
     const { room, player } = info;
     socket.leave(roomId);
+    socket.leave(`player:${player.playerId}`);
 
-    // If host leaves lobby, migrate to next player
-    if (player.isHost && !room.gameState) {
-      const newHost = roomManager.transferHostIfNeeded(roomId, player.playerId);
-      if (newHost) {
-        io.to(roomId).emit('room:state_update', buildLobbyState(room));
-      }
+    const leaveResult = roomManager.leaveRoom(roomId, player.playerId);
+    if (!leaveResult) return;
+
+    const { remainingRoom, removedPlayer } = leaveResult;
+
+    if (remainingRoom.players.length === 0) {
+      console.log(`[RoomManager] Room ${roomId} is now empty after player left`);
+      return;
     }
 
+    const updatedState: GameState = remainingRoom.gameState ?? buildLobbyState(remainingRoom);
+    broadcastState(roomId, updatedState);
+
     io.to(roomId).emit('room:player_left', {
-      playerId: player.playerId,
-      playerName: player.name,
+      playerId: removedPlayer.playerId,
+      playerName: removedPlayer.name,
     });
   }
 }
@@ -602,6 +573,6 @@ function buildLobbyState(room: Room): GS {
     matchStartTime: null,
     matchEndTime: null,
     winnerPlayerId: null,
-    version: 1,
+    version: room.version,
   };
 }

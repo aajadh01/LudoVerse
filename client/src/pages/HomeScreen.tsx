@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useGameRoom } from '@/hooks/useGameRoom';
-import { useSocket } from '@/hooks/useSocket';
+import { useSocket, loadSession } from '@/hooks/useSocket';
 import { LocalLudoEngine, LocalMatchRecord } from '@/lib/localEngine';
 import { GameRulePreset } from '@ludoverse/shared';
 import { cn } from '@/lib/utils';
@@ -81,7 +81,8 @@ export function HomeScreen() {
     setLoading(true);
     setError('');
 
-    joinRoom(clean, savedName.trim(), undefined, (err) => {
+    const existing = loadSession(clean);
+    joinRoom(clean, savedName.trim(), existing?.sessionToken, (err) => {
       setLoading(false);
       if (err) setError(err);
       else navigate(`/room/${clean}`);

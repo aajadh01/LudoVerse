@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
 import { GameState, GameMode, GameRulePreset } from '@ludoverse/shared';
-import { getSocket, saveSession, loadSession, clearSession } from '@/hooks/useSocket';
+import { getSocket, saveSession, loadSession, clearSession, getOrCreateUserId } from '@/hooks/useSocket';
 
 export interface ChatMessage {
   id: string;
@@ -83,7 +83,13 @@ export function GameRoomProvider({ children }: { children: React.ReactNode }) {
     };
 
     const onStateUpdate = (gs: GameState) => {
-      setGameState(gs);
+      setGameState(prev => {
+        if (prev && gs.version < prev.version) {
+          console.warn(`[Lobby] Rejected stale state update (incoming v${gs.version} < current v${prev.version})`);
+          return prev;
+        }
+        return gs;
+      });
     };
 
     const onGameStarted = (gs: GameState) => {
@@ -184,9 +190,10 @@ export function GameRoomProvider({ children }: { children: React.ReactNode }) {
       const session = loadSession();
       if (session?.roomId && session?.sessionToken) {
         socket.emit('room:join', {
-          roomId: session.roomId,
+          roomId: session.roomId.toUpperCase(),
           playerName: session.playerName,
           sessionToken: session.sessionToken,
+          userId: session.userId || getOrCreateUserId(),
         });
       }
     };
@@ -263,7 +270,8 @@ export function GameRoomProvider({ children }: { children: React.ReactNode }) {
       }
     }, 6000);
 
-    socket.emit('room:create', { playerName, mode, rulePreset, targetPlayerCount }, (res) => {
+    const userId = getOrCreateUserId();
+    socket.emit('room:create', { playerName, mode, rulePreset, targetPlayerCount, userId }, (res) => {
       if (resolved) return;
       resolved = true;
       clearTimeout(timer);
@@ -279,6 +287,11 @@ export function GameRoomProvider({ children }: { children: React.ReactNode }) {
   }, [socket]);
 
   const joinRoom = useCallback((roomId: string, playerName: string, token?: string, cb?: (err?: string) => void) => {
+    const cleanRoomId = roomId.trim().toUpperCase();
+    const existingSession = loadSession(cleanRoomId);
+    const tokenToUse = token || existingSession?.sessionToken;
+    const userId = getOrCreateUserId();
+
     if (!socket.connected) {
       socket.connect();
     }
@@ -293,7 +306,7 @@ export function GameRoomProvider({ children }: { children: React.ReactNode }) {
       }
     }, 6000);
 
-    socket.emit('room:join', { roomId: roomId.toUpperCase(), playerName, sessionToken: token }, (res) => {
+    socket.emit('room:join', { roomId: cleanRoomId, playerName, sessionToken: tokenToUse, userId }, (res) => {
       if (resolved) return;
       resolved = true;
       clearTimeout(timer);
@@ -304,7 +317,7 @@ export function GameRoomProvider({ children }: { children: React.ReactNode }) {
           err.toLowerCase().includes('expired') ||
           err.toLowerCase().includes('full')
         ) {
-          clearSession();
+          clearSession(cleanRoomId);
         }
         setErrorMsg(err);
         cb?.(err);
@@ -365,8 +378,9 @@ export function GameRoomProvider({ children }: { children: React.ReactNode }) {
   }, [socket]);
 
   const leaveRoom = useCallback((rId: string) => {
-    socket.emit('room:leave', { roomId: rId });
-    clearSession();
+    const clean = rId.trim().toUpperCase();
+    socket.emit('room:leave', { roomId: clean });
+    clearSession(clean);
     setGameState(null);
     setPlayerId(null);
     setSessionToken(null);

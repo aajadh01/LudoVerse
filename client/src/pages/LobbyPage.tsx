@@ -22,9 +22,9 @@ export default function LobbyPage() {
   const [directName, setDirectName] = useState(() => localStorage.getItem('ludoverse_player_name') || '');
   const [isJoiningDirect, setIsJoiningDirect] = useState(false);
   
-  // Check if we already have a session for this specific room
-  const initialSession = loadSession();
   const cleanRoomId = roomId.toUpperCase();
+  // Check if we already have a session for this specific room
+  const initialSession = loadSession(cleanRoomId);
   const hasMatchingSession = initialSession?.roomId === cleanRoomId && Boolean(initialSession?.sessionToken);
 
   // If no matching session exists, we do NOT wait at all; show the Join prompt immediately
@@ -65,7 +65,8 @@ export default function LobbyPage() {
     if (!trimmed || isJoiningDirect) return;
     localStorage.setItem('ludoverse_player_name', trimmed);
     setIsJoiningDirect(true);
-    joinRoom(cleanRoomId, trimmed, undefined, (_err) => {
+    const existingSession = loadSession(cleanRoomId);
+    joinRoom(cleanRoomId, trimmed, existingSession?.sessionToken, (_err) => {
       setIsJoiningDirect(false);
       setTimedOutWaiting(true);
     });
@@ -112,7 +113,7 @@ export default function LobbyPage() {
   };
 
   const handleLeave = () => {
-    clearSession();
+    clearSession(cleanRoomId);
     leaveRoom(cleanRoomId);
     navigate('/', { replace: true });
   };

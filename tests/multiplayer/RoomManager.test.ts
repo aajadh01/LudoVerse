@@ -100,6 +100,100 @@ describe('RoomManager — Lifecycle & Authorization', () => {
         expect(reconnect.player.playerId).toBe(player.playerId); // Same identity
       }
     });
+
+    it('idempotently reuses player slot when joining repeatedly with the same userId (no duplicate players)', () => {
+      const { room } = manager.createRoom({ hostName: 'Host', socketId: 's1', userId: 'user-host' });
+
+      // Guest joins with userId 'user-guest'
+      const join1 = manager.joinRoom({
+        roomId: room.roomId,
+        playerName: 'Guest',
+        socketId: 's2',
+        userId: 'user-guest',
+      });
+      expect('error' in join1).toBe(false);
+      expect(room.players).toHaveLength(2);
+
+      // Guest navigates back and joins again with same userId (even without sessionToken)
+      const join2 = manager.joinRoom({
+        roomId: room.roomId,
+        playerName: 'Guest',
+        socketId: 's2-tab2',
+        userId: 'user-guest',
+      });
+      expect('error' in join2).toBe(false);
+      if (!('error' in join2)) {
+        expect(join2.isReconnect).toBe(true);
+        expect(join2.player.playerId).toBe((join1 as any).player.playerId);
+      }
+
+      // Crucial: player count MUST still be 2, NOT 3!
+      expect(room.players).toHaveLength(2);
+    });
+
+    it('gives distinct identities to two different players with the same display name', () => {
+      const { room } = manager.createRoom({ hostName: 'Alex', socketId: 's1', userId: 'user-1' });
+
+      // Different physical user also named Alex
+      const join = manager.joinRoom({
+        roomId: room.roomId,
+        playerName: 'Alex',
+        socketId: 's2',
+        userId: 'user-2',
+      });
+
+      expect('error' in join).toBe(false);
+      expect(room.players).toHaveLength(2);
+      expect(room.players[0].playerId).not.toBe(room.players[1].playerId);
+      expect(room.players[0].name).toBe('Alex');
+      expect(room.players[1].name).toBe('Alex');
+    });
+
+    it('explicitly removes player from room.players on lobby leave', () => {
+      const { room } = manager.createRoom({ hostName: 'Host', socketId: 's1', userId: 'user-host' });
+      const guestJoin = manager.joinRoom({
+        roomId: room.roomId,
+        playerName: 'Guest',
+        socketId: 's2',
+        userId: 'user-guest',
+      });
+      if ('error' in guestJoin) throw new Error(guestJoin.error);
+      expect(room.players).toHaveLength(2);
+
+      // Guest explicitly leaves the lobby
+      const leaveResult = manager.leaveRoom(room.roomId, guestJoin.player.playerId);
+      expect(leaveResult).toBeTruthy();
+      expect(room.players).toHaveLength(1);
+      expect(room.players[0].playerId).not.toBe(guestJoin.player.playerId);
+
+      // Guest rejoins later
+      const rejoin = manager.joinRoom({
+        roomId: room.roomId,
+        playerName: 'Guest',
+        socketId: 's3',
+        userId: 'user-guest',
+      });
+      expect('error' in rejoin).toBe(false);
+      expect(room.players).toHaveLength(2);
+    });
+
+    it('transfers host role to remaining player when host explicitly leaves lobby', () => {
+      const { room, player: host } = manager.createRoom({ hostName: 'Host', socketId: 's1', userId: 'user-host' });
+      const guestJoin = manager.joinRoom({
+        roomId: room.roomId,
+        playerName: 'Guest',
+        socketId: 's2',
+        userId: 'user-guest',
+      });
+      if ('error' in guestJoin) throw new Error(guestJoin.error);
+
+      // Host leaves
+      const leaveResult = manager.leaveRoom(room.roomId, host.playerId);
+      expect(leaveResult).toBeTruthy();
+      expect(leaveResult?.newHost).toBeTruthy();
+      expect(leaveResult?.newHost?.playerId).toBe(guestJoin.player.playerId);
+      expect(room.players[0].isHost).toBe(true);
+    });
   });
 
   describe('Authorization & Host Controls', () => {
@@ -164,6 +258,23 @@ describe('RoomManager — Lifecycle & Authorization', () => {
       expect('error' in result).toBe(true);
       if ('error' in result) {
         expect(result.error).toContain('ready');
+      }
+    });
+
+    it('rejects duplicate start requests when game is already in progress', () => {
+      const { room, player: host } = manager.createRoom({ hostName: 'Host', socketId: 's1' });
+      const join = manager.joinRoom({ roomId: room.roomId, playerName: 'Guest', socketId: 's2' });
+      if ('error' in join) throw new Error('unexpected join failure');
+
+      manager.setReady(room.roomId, join.player.playerId, true);
+      const start1 = manager.startGame(room.roomId, host.playerId);
+      expect('error' in start1).toBe(false);
+
+      // Attempt repeated start
+      const start2 = manager.startGame(room.roomId, host.playerId);
+      expect('error' in start2).toBe(true);
+      if ('error' in start2) {
+        expect(start2.error).toContain('already in progress');
       }
     });
   });

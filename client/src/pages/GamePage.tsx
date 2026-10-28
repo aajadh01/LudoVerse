@@ -83,12 +83,12 @@ export default function GamePage() {
   useEffect(() => {
     if (!gameState && !reconnectTried.current) {
       reconnectTried.current = true;
-      const session = loadSession();
       const clean = roomId.toUpperCase();
+      const session = loadSession(clean);
       if (session?.roomId === clean && session?.sessionToken) {
         joinRoom(clean, session.playerName, session.sessionToken, (err) => {
           if (err) {
-            clearSession();
+            clearSession(clean);
             setArenaTimedOut(true);
           }
         });
