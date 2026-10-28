@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { PlayerState } from '@ludoverse/shared';
 import { PLAYER_COLORS } from '@/lib/constants';
 import { cn } from '@/lib/utils';
@@ -33,19 +33,39 @@ export function PlayerVideoStation({
   className,
   compact = false,
 }: PlayerVideoStationProps) {
+  const [isVideoPlaying, setIsVideoPlaying] = useState(false);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const color = PLAYER_COLORS[player.color];
 
-  // Attach stream to video element with explicit play()
+  // Callback ref guarantees that the video element receives srcObject the moment it mounts or when stream updates
+  const setVideoRef = useCallback((el: HTMLVideoElement | null) => {
+    videoRef.current = el;
+    if (el) {
+      if (stream && stream.getVideoTracks().length > 0) {
+        if (el.srcObject !== stream) {
+          el.srcObject = stream;
+        }
+        el.play().catch(() => {});
+      } else {
+        el.srcObject = null;
+        setIsVideoPlaying(false);
+      }
+    }
+  }, [stream]);
+
+  // Synchronize on stream prop updates
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
 
     if (stream && stream.getVideoTracks().length > 0) {
-      video.srcObject = stream;
+      if (video.srcObject !== stream) {
+        video.srcObject = stream;
+      }
       video.play().catch(() => {});
     } else {
       video.srcObject = null;
+      setIsVideoPlaying(false);
     }
   }, [stream]);
 
@@ -78,36 +98,48 @@ export function PlayerVideoStation({
         'relative w-full rounded-t-xl overflow-hidden bg-[#0A1628] flex items-center justify-center border-b border-[#1E3A8A]',
         compact ? 'aspect-square max-h-20' : 'aspect-[4/3] max-h-24 sm:max-h-28'
       )}>
-        {hasActiveVideo ? (
-          <video
-            ref={videoRef}
-            autoPlay
-            playsInline
-            muted
-            className="w-full h-full object-cover"
-          />
-        ) : isCameraActive ? (
-          <div className="w-full h-full flex flex-col items-center justify-center gap-1 bg-[#0D2147] text-white">
-            <Loader2 size={18} className="animate-spin text-emerald-400" />
-            <span className="text-[9px] text-emerald-300 font-bold">Cam Live</span>
-          </div>
-        ) : (
-          <div
-            className="w-full h-full flex flex-col items-center justify-center gap-1"
-            style={{ backgroundColor: `${color.hex}25` }}
-          >
-            <div
-              className="w-11 h-11 rounded-full flex items-center justify-center text-base font-black shadow-md"
-              style={{ backgroundColor: color.hex, color: '#FFFFFF', border: '2px solid #FFFFFF' }}
-            >
-              {player.name.slice(0, 2).toUpperCase()}
+        {/* Permanent Video Element: never unmounted to ensure seamless rendering across WAN */}
+        <video
+          ref={setVideoRef}
+          autoPlay
+          playsInline
+          muted
+          onLoadedData={() => setIsVideoPlaying(true)}
+          onPlaying={() => setIsVideoPlaying(true)}
+          onPause={() => setIsVideoPlaying(false)}
+          onEnded={() => setIsVideoPlaying(false)}
+          onError={() => setIsVideoPlaying(false)}
+          className={cn(
+            "w-full h-full object-cover transition-opacity duration-300",
+            isVideoPlaying && hasActiveVideo ? "opacity-100 relative z-10" : "opacity-0 absolute inset-0 pointer-events-none"
+          )}
+        />
+
+        {/* Underneath Shield: Active until decoded frames are actively playing */}
+        {(!isVideoPlaying || !hasActiveVideo) && (
+          isCameraActive ? (
+            <div className="w-full h-full flex flex-col items-center justify-center gap-1 bg-[#0D2147] text-white">
+              <Loader2 size={18} className="animate-spin text-emerald-400" />
+              <span className="text-[9px] text-emerald-300 font-bold">Cam Live</span>
             </div>
-            {isMe && !cameraEnabled && (
-              <span className="text-[9px] text-white/60 flex items-center gap-0.5 font-medium">
-                <VideoOff size={10} /> Cam off
-              </span>
-            )}
-          </div>
+          ) : (
+            <div
+              className="w-full h-full flex flex-col items-center justify-center gap-1"
+              style={{ backgroundColor: `${color.hex}25` }}
+            >
+              <div
+                className="w-11 h-11 rounded-full flex items-center justify-center text-base font-black shadow-md"
+                style={{ backgroundColor: color.hex, color: '#FFFFFF', border: '2px solid #FFFFFF' }}
+              >
+                {player.name.slice(0, 2).toUpperCase()}
+              </div>
+              {isMe && !cameraEnabled && (
+                <span className="text-[9px] text-white/60 flex items-center gap-0.5 font-medium">
+                  <VideoOff size={10} /> Cam off
+                </span>
+              )}
+            </div>
+          )
         )}
 
         {/* Live Camera indicator badge */}

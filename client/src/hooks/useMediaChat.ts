@@ -14,21 +14,27 @@ export interface UseMediaChatReturn {
   errorMsg: string | null;
 }
 
-// Robust STUN + Free OpenRelay TURN servers for cross-network / mobile cellular NAT traversal (4G/5G/WAN)
+// Robust STUN + Multi-transport TURN servers for cross-network / mobile cellular NAT traversal (4G/5G/WAN)
 const RTC_CONFIG: RTCConfiguration = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:stun2.l.google.com:19302' },
+    { urls: 'stun:stun3.l.google.com:19302' },
     { urls: 'stun:stun.cloudflare.com:3478' },
+    { urls: 'stun:stun.metered.ca:80' },
+    { urls: 'stun:relay.metered.ca:80' },
     {
       urls: [
-        'turn:openrelay.metered.ca:80',
-        'turn:openrelay.metered.ca:443',
-        'turn:openrelay.metered.ca:443?transport=tcp',
+        'turn:relay.metered.ca:80',
+        'turn:relay.metered.ca:80?transport=tcp',
+        'turn:global.relay.metered.ca:80',
+        'turn:global.relay.metered.ca:80?transport=tcp',
+        'turn:global.relay.metered.ca:443',
+        'turn:global.relay.metered.ca:443?transport=tcp',
       ],
-      username: 'openrelay',
-      credential: 'openrelay',
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
     },
   ],
   iceCandidatePoolSize: 10,
@@ -141,18 +147,23 @@ export function useMediaChat(
 
     pc = new RTCPeerConnection(RTC_CONFIG);
 
-    // Attach active local audio tracks if enabled
-    if (localAudioStreamRef.current) {
-      localAudioStreamRef.current.getAudioTracks().forEach(track => {
-        pc!.addTrack(track, localAudioStreamRef.current!);
-      });
-    }
+    // Initialize bidirectional audio/video transceivers or attach active tracks
+    try {
+      const audioTrack = localAudioStreamRef.current?.getAudioTracks()[0];
+      if (audioTrack && localAudioStreamRef.current) {
+        pc.addTrack(audioTrack, localAudioStreamRef.current);
+      } else {
+        pc.addTransceiver('audio', { direction: 'recvonly' });
+      }
 
-    // Attach active local video tracks if enabled
-    if (localVideoStreamRef.current) {
-      localVideoStreamRef.current.getVideoTracks().forEach(track => {
-        pc!.addTrack(track, localVideoStreamRef.current!);
-      });
+      const videoTrack = localVideoStreamRef.current?.getVideoTracks()[0];
+      if (videoTrack && localVideoStreamRef.current) {
+        pc.addTrack(videoTrack, localVideoStreamRef.current);
+      } else {
+        pc.addTransceiver('video', { direction: 'recvonly' });
+      }
+    } catch (e) {
+      console.warn('[WebRTC] Transceiver setup note:', e);
     }
 
     pc.onicecandidate = (event) => {
@@ -173,26 +184,33 @@ export function useMediaChat(
     };
 
     pc.ontrack = (event) => {
-      const { track, streams } = event;
-      const stream = streams[0] || new MediaStream([track]);
+      const { track } = event;
 
       if (track.kind === 'video') {
-        setRemoteStreams(prev => {
-          const next = new Map(prev);
-          let targetStream = next.get(targetPlayerId);
-          if (!targetStream) {
-            targetStream = new MediaStream();
-            next.set(targetPlayerId, targetStream);
-          }
-          // Remove old video tracks to avoid duplicates
-          targetStream.getVideoTracks().forEach(t => {
-            if (t.id !== track.id) targetStream!.removeTrack(t);
+        const updateVideoStream = () => {
+          setRemoteStreams(prev => {
+            const next = new Map(prev);
+            // Dispatch a fresh MediaStream instance with the live track so React reference checks re-render immediately
+            next.set(targetPlayerId, new MediaStream([track]));
+            return next;
           });
-          if (!targetStream.getTracks().some(t => t.id === track.id)) {
-            targetStream.addTrack(track);
-          }
-          return new Map(next);
-        });
+        };
+
+        // Attach immediately
+        updateVideoStream();
+
+        // Listen for unmute event (the moment the first network packet arrives and video decodes)
+        track.onunmute = () => {
+          updateVideoStream();
+        };
+
+        track.onended = () => {
+          setRemoteStreams(prev => {
+            const next = new Map(prev);
+            next.delete(targetPlayerId);
+            return next;
+          });
+        };
       }
 
       if (track.kind === 'audio') {
@@ -201,10 +219,15 @@ export function useMediaChat(
         if (!audioEl) {
           audioEl = new Audio();
           audioEl.autoplay = true;
+          audioEl.volume = 1.0;
           remoteAudioElementsRef.current.set(targetPlayerId, audioEl);
         }
         audioEl.srcObject = new MediaStream([track]);
         audioEl.play().catch(e => console.warn('Audio play autoplay policy:', e));
+
+        track.onunmute = () => {
+          audioEl?.play().catch(() => {});
+        };
       }
     };
 
@@ -237,6 +260,29 @@ export function useMediaChat(
 
           await pc.setRemoteDescription(new RTCSessionDescription(signal));
           await drainCandidateQueue(senderPlayerId, pc);
+
+          // If we have active local tracks, attach them to existing transceivers before creating answer
+          if (localAudioStreamRef.current) {
+            const at = localAudioStreamRef.current.getAudioTracks()[0];
+            const audioTransceiver = pc.getTransceivers().find(
+              t => t.receiver.track.kind === 'audio' || t.sender.track?.kind === 'audio'
+            );
+            if (audioTransceiver && at) {
+              audioTransceiver.direction = 'sendrecv';
+              await audioTransceiver.sender.replaceTrack(at);
+            }
+          }
+
+          if (localVideoStreamRef.current) {
+            const vt = localVideoStreamRef.current.getVideoTracks()[0];
+            const videoTransceiver = pc.getTransceivers().find(
+              t => t.receiver.track.kind === 'video' || t.sender.track?.kind === 'video'
+            );
+            if (videoTransceiver && vt) {
+              videoTransceiver.direction = 'sendrecv';
+              await videoTransceiver.sender.replaceTrack(vt);
+            }
+          }
 
           const answer = await pc.createAnswer();
           await pc.setLocalDescription(answer);
@@ -301,11 +347,14 @@ export function useMediaChat(
       if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
       if (audioContextRef.current) audioContextRef.current.close().catch(() => {});
 
-      // Replace audio track with null on all peers to mute instantly
+      // Replace audio track with null and set direction to recvonly
       peersRef.current.forEach(pc => {
-        const sender = pc.getSenders().find(s => s.track?.kind === 'audio');
-        if (sender) {
-          sender.replaceTrack(null);
+        const audioTransceiver = pc.getTransceivers().find(
+          t => t.receiver.track.kind === 'audio' || t.sender.track?.kind === 'audio'
+        );
+        if (audioTransceiver) {
+          audioTransceiver.sender.replaceTrack(null);
+          audioTransceiver.direction = 'recvonly';
         }
       });
 
@@ -347,12 +396,18 @@ export function useMediaChat(
       otherPlayerIds.forEach(async (targetId) => {
         if (targetId === myPlayerId) return;
         const pc = getOrCreatePeerConnection(targetId);
-        const sender = pc.getSenders().find(s => s.track?.kind === 'audio');
+        const audioTransceiver = pc.getTransceivers().find(
+          t => t.receiver.track.kind === 'audio' || t.sender.track?.kind === 'audio'
+        );
 
-        if (sender) {
-          await sender.replaceTrack(audioTrack);
+        if (audioTransceiver) {
+          audioTransceiver.direction = 'sendrecv';
+          await audioTransceiver.sender.replaceTrack(audioTrack);
         } else {
           pc.addTrack(audioTrack, stream);
+        }
+
+        try {
           const offer = await pc.createOffer();
           await pc.setLocalDescription(offer);
           socket.emit('webrtc:signal', {
@@ -360,6 +415,8 @@ export function useMediaChat(
             targetPlayerId: targetId,
             signal: offer,
           });
+        } catch (e) {
+          console.warn('[WebRTC] Mic offer creation error:', e);
         }
       });
     } catch {
@@ -380,11 +437,14 @@ export function useMediaChat(
       setCameraEnabled(false);
       socket.emit('media:status', { roomId, cameraEnabled: false, micEnabled });
 
-      // Replace video track with null on all peers to turn off video immediately
+      // Replace video track with null and set direction to recvonly
       peersRef.current.forEach(pc => {
-        const sender = pc.getSenders().find(s => s.track?.kind === 'video');
-        if (sender) {
-          sender.replaceTrack(null);
+        const videoTransceiver = pc.getTransceivers().find(
+          t => t.receiver.track.kind === 'video' || t.sender.track?.kind === 'video'
+        );
+        if (videoTransceiver) {
+          videoTransceiver.sender.replaceTrack(null);
+          videoTransceiver.direction = 'recvonly';
         }
       });
       return;
@@ -413,21 +473,28 @@ export function useMediaChat(
       otherPlayerIds.forEach(async (targetId) => {
         if (targetId === myPlayerId) return;
         const pc = getOrCreatePeerConnection(targetId);
-        const sender = pc.getSenders().find(s => s.track?.kind === 'video');
+        const videoTransceiver = pc.getTransceivers().find(
+          t => t.receiver.track.kind === 'video' || t.sender.track?.kind === 'video'
+        );
 
-        if (sender) {
-          await sender.replaceTrack(videoTrack);
+        if (videoTransceiver) {
+          videoTransceiver.direction = 'sendrecv';
+          await videoTransceiver.sender.replaceTrack(videoTrack);
         } else {
           pc.addTrack(videoTrack, stream);
         }
 
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        socket.emit('webrtc:signal', {
-          roomId,
-          targetPlayerId: targetId,
-          signal: offer,
-        });
+        try {
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          socket.emit('webrtc:signal', {
+            roomId,
+            targetPlayerId: targetId,
+            signal: offer,
+          });
+        } catch (e) {
+          console.warn('[WebRTC] Cam offer creation error:', e);
+        }
       });
     } catch {
       setErrorMsg('Camera access denied or not available');
@@ -435,6 +502,55 @@ export function useMediaChat(
       setTimeout(() => setErrorMsg(null), 4000);
     }
   };
+
+  // Auto-negotiate with newly joined peers if local media is already active
+  useEffect(() => {
+    if (!myPlayerId) return;
+    if (!cameraEnabled && !micEnabled) return;
+
+    otherPlayerIds.forEach(async (targetId) => {
+      if (targetId === myPlayerId) return;
+      const pc = getOrCreatePeerConnection(targetId);
+
+      // Re-apply local tracks to this peer
+      if (localVideoStreamRef.current) {
+        const vt = localVideoStreamRef.current.getVideoTracks()[0];
+        const vTransceiver = pc.getTransceivers().find(
+          t => t.receiver.track.kind === 'video' || t.sender.track?.kind === 'video'
+        );
+        if (vTransceiver && vt) {
+          vTransceiver.direction = 'sendrecv';
+          await vTransceiver.sender.replaceTrack(vt);
+        }
+      }
+
+      if (localAudioStreamRef.current) {
+        const at = localAudioStreamRef.current.getAudioTracks()[0];
+        const aTransceiver = pc.getTransceivers().find(
+          t => t.receiver.track.kind === 'audio' || t.sender.track?.kind === 'audio'
+        );
+        if (aTransceiver && at) {
+          aTransceiver.direction = 'sendrecv';
+          await aTransceiver.sender.replaceTrack(at);
+        }
+      }
+
+      // Initiate renegotiation if polite or connection is stable
+      if (pc.signalingState === 'stable') {
+        try {
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          socket.emit('webrtc:signal', {
+            roomId,
+            targetPlayerId: targetId,
+            signal: offer,
+          });
+        } catch (e) {
+          console.warn('[WebRTC] Peer sync offer error:', e);
+        }
+      }
+    });
+  }, [otherPlayerIds, cameraEnabled, micEnabled, myPlayerId, getOrCreatePeerConnection, roomId, socket]);
 
   // Clean up all peers, audio elements, and media tracks on unmount
   useEffect(() => {

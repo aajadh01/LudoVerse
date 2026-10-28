@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { PlayerState } from '@ludoverse/shared';
 import { PLAYER_COLORS } from '@/lib/constants';
 import { cn } from '@/lib/utils';
@@ -55,24 +55,44 @@ export function IntegratedPlayerDiceStation({
   capturesCount = 0,
   className,
 }: IntegratedPlayerDiceStationProps) {
+  const [isVideoPlaying, setIsVideoPlaying] = useState(false);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const color = PLAYER_COLORS[player.color] || PLAYER_COLORS.red;
 
-  // Stream video track attach with explicit play() trigger
+  const hasActiveVideo = Boolean(stream && stream.getVideoTracks().some((t) => t.readyState === 'live' && t.enabled));
+  const isCameraActive = isMe ? !!cameraEnabled : !!isRemoteCameraOn || hasActiveVideo;
+
+  // Callback ref guarantees that the video element attaches srcObject the moment it mounts or when stream updates
+  const setVideoRef = useCallback((el: HTMLVideoElement | null) => {
+    videoRef.current = el;
+    if (el) {
+      if (stream && stream.getVideoTracks().length > 0) {
+        if (el.srcObject !== stream) {
+          el.srcObject = stream;
+        }
+        el.play().catch(() => {});
+      } else {
+        el.srcObject = null;
+        setIsVideoPlaying(false);
+      }
+    }
+  }, [stream]);
+
+  // Synchronize on stream prop updates
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
 
     if (stream && stream.getVideoTracks().length > 0) {
-      video.srcObject = stream;
+      if (video.srcObject !== stream) {
+        video.srcObject = stream;
+      }
       video.play().catch(() => {});
     } else {
       video.srcObject = null;
+      setIsVideoPlaying(false);
     }
   }, [stream]);
-
-  const hasActiveVideo = Boolean(stream && stream.getVideoTracks().some((t) => t.readyState === 'live' && t.enabled));
-  const isCameraActive = isMe ? !!cameraEnabled : !!isRemoteCameraOn || hasActiveVideo;
 
   const canRollNow = isActive && turnPhase === 'WAITING_FOR_ROLL' && isMe && !isRolling;
   const showDiceSlot = isActive || currentDice !== null;
@@ -114,31 +134,43 @@ export function IntegratedPlayerDiceStation({
       )}>
         {/* 1. Avatar / Camera Video Box */}
         <div className="relative w-16 h-16 sm:w-18 sm:h-18 rounded-xl overflow-hidden bg-[#0A1628] border-2 border-[#FFC928]/70 shadow-inner shrink-0 flex items-center justify-center">
-          {hasActiveVideo ? (
-            <video
-              ref={videoRef}
-              autoPlay
-              playsInline
-              muted
-              className="w-full h-full object-cover"
-            />
-          ) : isCameraActive ? (
-            <div className="w-full h-full flex flex-col items-center justify-center gap-1 bg-[#0A1E40] text-emerald-300">
-              <Loader2 size={16} className="animate-spin text-emerald-400" />
-              <span className="text-[8px] font-black uppercase">Live</span>
-            </div>
-          ) : (
-            <div
-              className="w-full h-full flex flex-col items-center justify-center"
-              style={{ backgroundColor: `${color.hex}22` }}
-            >
-              <div
-                className="w-10 h-10 rounded-full flex items-center justify-center text-sm font-black shadow-md border-2 border-white"
-                style={{ backgroundColor: color.hex, color: '#FFFFFF' }}
-              >
-                {player.name.slice(0, 2).toUpperCase()}
+          {/* Permanent Video Element: never unmounted so media pipeline never freezes on empty black rectangle */}
+          <video
+            ref={setVideoRef}
+            autoPlay
+            playsInline
+            muted
+            onLoadedData={() => setIsVideoPlaying(true)}
+            onPlaying={() => setIsVideoPlaying(true)}
+            onPause={() => setIsVideoPlaying(false)}
+            onEnded={() => setIsVideoPlaying(false)}
+            onError={() => setIsVideoPlaying(false)}
+            className={cn(
+              "w-full h-full object-cover transition-opacity duration-300",
+              isVideoPlaying && hasActiveVideo ? "opacity-100 relative z-10" : "opacity-0 absolute inset-0 pointer-events-none"
+            )}
+          />
+
+          {/* Underneath Shield: Active until decoded frames are actively playing */}
+          {(!isVideoPlaying || !hasActiveVideo) && (
+            isCameraActive ? (
+              <div className="w-full h-full flex flex-col items-center justify-center gap-1 bg-[#0A1E40] text-emerald-300">
+                <Loader2 size={16} className="animate-spin text-emerald-400" />
+                <span className="text-[8px] font-black uppercase tracking-wider">Live</span>
               </div>
-            </div>
+            ) : (
+              <div
+                className="w-full h-full flex flex-col items-center justify-center"
+                style={{ backgroundColor: `${color.hex}22` }}
+              >
+                <div
+                  className="w-10 h-10 rounded-full flex items-center justify-center text-sm font-black shadow-md border-2 border-white"
+                  style={{ backgroundColor: color.hex, color: '#FFFFFF' }}
+                >
+                  {player.name.slice(0, 2).toUpperCase()}
+                </div>
+              </div>
+            )
           )}
 
           {/* Camera live badge */}
