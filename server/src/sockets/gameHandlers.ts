@@ -489,6 +489,17 @@ export function registerSocketHandlers(io: LudoServer, roomManager: RoomManager)
       });
     });
 
+    // ── Media Speaking (Active voice pulse animation) ────────
+    socket.on('media:speaking' as any, (data: any) => {
+      const entry = roomManager.getRoomBySocketId(socket.id);
+      if (!entry) return;
+
+      socket.to(data.roomId).emit('media:player_speaking' as any, {
+        playerId: entry.player.playerId,
+        isSpeaking: data.isSpeaking,
+      });
+    });
+
     // ── Room: Leave ──────────────────────────────────────────
     socket.on('room:leave', (data) => {
       handleLeave(socket, data.roomId);
