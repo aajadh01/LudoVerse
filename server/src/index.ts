@@ -10,6 +10,7 @@ import { RoomManager } from './rooms/RoomManager.js';
 import { registerSocketHandlers } from './sockets/gameHandlers.js';
 import { connectDB, getRecentMatches } from './db/connection.js';
 import { getWebRtcConfig } from './webrtc/iceConfig.js';
+import { createLiveKitTokenHandler } from './livekit/tokenController.js';
 
 const clientDistPath = fs.existsSync(path.resolve(process.cwd(), 'client/dist'))
   ? path.resolve(process.cwd(), 'client/dist')
@@ -17,6 +18,9 @@ const clientDistPath = fs.existsSync(path.resolve(process.cwd(), 'client/dist'))
 
 const PORT = Number(process.env['PORT'] ?? 3001);
 const CLIENT_ORIGIN = process.env['CLIENT_ORIGIN'];
+
+// Initialize room manager before routes so it's accessible everywhere
+const roomManager = new RoomManager();
 
 // ─── Express ────────────────────────────────────────────────────────────────
 const app = express();
@@ -35,6 +39,11 @@ app.use(express.json());
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', ts: Date.now() });
 });
+
+// LiveKit Access Token Endpoint (authenticated & room-scoped)
+const liveKitHandler = createLiveKitTokenHandler(roomManager);
+app.post('/api/livekit/token', liveKitHandler);
+app.get('/api/livekit/token', liveKitHandler);
 
 app.get('/api/webrtc/config', async (_req, res) => {
   try {
@@ -122,7 +131,6 @@ const io = new Server<ClientToServerEvents, ServerToClientEvents>(httpServer, {
   pingInterval: 10_000,
 });
 
-const roomManager = new RoomManager();
 registerSocketHandlers(io, roomManager);
 
 // ─── Start ───────────────────────────────────────────────────────────────────

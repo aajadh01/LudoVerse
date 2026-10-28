@@ -75,7 +75,7 @@ export function PlayerVideoStation({
     stream.getVideoTracks().some(t => t.readyState === 'live' && (isMe ? t.enabled : !t.muted))
   );
   const isCameraActive = isMe ? !!cameraEnabled : !!isRemoteCameraOn;
-  const isRenderingLive = isVideoPlaying && (isMe ? hasActiveVideo : true);
+  const isRenderingLive = isCameraActive && isVideoPlaying && Boolean(stream && stream.getVideoTracks().length > 0);
 
   return (
     <div
@@ -99,7 +99,8 @@ export function PlayerVideoStation({
 
       {/* Video Window / Avatar Area */}
       <div className={cn(
-        'relative w-full rounded-t-xl overflow-hidden bg-[#0A1628] flex items-center justify-center border-b border-[#1E3A8A]',
+        'relative w-full rounded-t-xl overflow-hidden bg-[#0A1628] flex items-center justify-center border-b transition-colors duration-200',
+        isSpeaking ? 'border-emerald-400' : 'border-[#1E3A8A]',
         compact ? 'aspect-square max-h-20' : 'aspect-[4/3] max-h-24 sm:max-h-28'
       )}>
         {/* Permanent Video Element: never unmounted to ensure seamless rendering across WAN */}

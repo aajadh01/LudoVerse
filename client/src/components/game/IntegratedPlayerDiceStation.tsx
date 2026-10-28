@@ -64,7 +64,7 @@ export function IntegratedPlayerDiceStation({
     stream.getVideoTracks().some((t) => t.readyState === 'live' && (isMe ? t.enabled : !t.muted))
   );
   const isCameraActive = isMe ? !!cameraEnabled : !!isRemoteCameraOn;
-  const isRenderingLive = isVideoPlaying && (isMe ? hasActiveVideo : true);
+  const isRenderingLive = isCameraActive && isVideoPlaying && Boolean(stream && stream.getVideoTracks().length > 0);
 
   // Callback ref guarantees that the video element attaches srcObject the moment it mounts or when stream updates
   const setVideoRef = useCallback((el: HTMLVideoElement | null) => {
@@ -107,6 +107,8 @@ export function IntegratedPlayerDiceStation({
         'relative flex flex-col rounded-2xl border-2 transition-all duration-300 shadow-2xl select-none bg-gradient-to-b from-[#0B2A6B] to-[#04153B]',
         isActive
           ? 'border-[#FFC928] ring-4 ring-[#FFC928]/40 shadow-[#FFC928]/40 scale-[1.02] z-30'
+          : isSpeaking
+          ? 'border-emerald-400 ring-2 ring-emerald-400/60 shadow-[0_0_15px_rgba(52,211,153,0.4)]'
           : 'border-[#1C458A]',
         'min-w-[170px] max-w-[210px] w-full',
         className
@@ -137,7 +139,12 @@ export function IntegratedPlayerDiceStation({
         orientation === 'right' ? 'flex-row-reverse' : 'flex-row'
       )}>
         {/* 1. Avatar / Camera Video Box */}
-        <div className="relative w-16 h-16 sm:w-18 sm:h-18 rounded-xl overflow-hidden bg-[#0A1628] border-2 border-[#FFC928]/70 shadow-inner shrink-0 flex items-center justify-center">
+        <div className={cn(
+          "relative w-16 h-16 sm:w-18 sm:h-18 rounded-xl overflow-hidden bg-[#0A1628] border-2 shadow-inner shrink-0 flex items-center justify-center transition-all duration-200",
+          isSpeaking
+            ? "border-emerald-400 ring-2 ring-emerald-400/80 shadow-[0_0_12px_rgba(52,211,153,0.7)]"
+            : "border-[#FFC928]/70"
+        )}>
           {/* Permanent Video Element: never unmounted so media pipeline never freezes on empty black rectangle */}
           <video
             ref={setVideoRef}

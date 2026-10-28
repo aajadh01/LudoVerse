@@ -1,5 +1,20 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { getSocket } from './useSocket';
+import {
+  Room,
+  RoomEvent,
+  Track,
+  RemoteTrack,
+  RemoteTrackPublication,
+  RemoteParticipant,
+  Participant,
+  LocalVideoTrack,
+  LocalAudioTrack,
+  createLocalVideoTrack,
+  createLocalAudioTrack,
+  VideoPresets,
+  TrackPublication,
+} from 'livekit-client';
+import { getSocket, loadSession, getOrCreateUserId } from './useSocket';
 
 export interface UseMediaChatReturn {
   micEnabled: boolean;
@@ -14,842 +29,433 @@ export interface UseMediaChatReturn {
   errorMsg: string | null;
 }
 
-// Fallback STUN servers (used if server config fetch fails)
-const FALLBACK_RTC_CONFIG: RTCConfiguration = {
-  iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun2.l.google.com:19302' },
-    { urls: 'stun:stun3.l.google.com:19302' },
-    { urls: 'stun:stun.cloudflare.com:3478' },
-  ],
-  iceCandidatePoolSize: 10,
-};
-
 export function useMediaChat(
   roomId: string,
   myPlayerId: string | null,
-  otherPlayerIds: string[] = []
+  _otherPlayerIds: string[] = []
 ): UseMediaChatReturn {
   const [micEnabled, setMicEnabled] = useState(false);
   const [cameraEnabled, setCameraEnabled] = useState(false);
   const [speakingPlayers, setSpeakingPlayers] = useState<Set<string>>(new Set());
   const [remoteStreams, setRemoteStreams] = useState<Map<string, MediaStream>>(new Map());
-  const [remoteMediaStatus, setRemoteMediaStatus] = useState<Map<string, { cameraEnabled: boolean; micEnabled: boolean }>>(new Map());
+  const [remoteMediaStatus, setRemoteMediaStatus] = useState<
+    Map<string, { cameraEnabled: boolean; micEnabled: boolean }>
+  >(new Map());
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
-  const localAudioStreamRef = useRef<MediaStream | null>(null);
-  const localVideoStreamRef = useRef<MediaStream | null>(null);
   const [localVideoStream, setLocalVideoStream] = useState<MediaStream | null>(null);
-  const [localStream, setLocalStream] = useState<MediaStream | null>(null);
 
-  const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map());
-  const makingOfferRef = useRef<Map<string, boolean>>(new Map());
-  const ignoreOfferRef = useRef<Map<string, boolean>>(new Map());
-  const candidateQueueRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
-  const remoteAudioElementsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
-  const knownPeerIdsRef = useRef<Set<string>>(new Set());
-
-  const rtcConfigRef = useRef<RTCConfiguration>(FALLBACK_RTC_CONFIG);
-  const isRtcConfigLoadedRef = useRef<boolean>(false);
-
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null);
-  const animFrameRef = useRef<number | null>(null);
+  const roomRef = useRef<Room | null>(null);
+  const localVideoTrackRef = useRef<LocalVideoTrack | null>(null);
+  const localAudioTrackRef = useRef<LocalAudioTrack | null>(null);
+  const attachedAudioElementsRef = useRef<Map<string, HTMLMediaElement>>(new Map());
+  const isConnectingRef = useRef<boolean>(false);
 
   const socket = getSocket();
 
-  // 1. Fetch dynamic ICE configuration from server (/api/webrtc/config)
+  // ─── 1. Connect to LiveKit Room via Authenticated Backend Token ────────────
   useEffect(() => {
-    let isMounted = true;
-    async function loadIceConfig() {
-      try {
-        const res = await fetch('/api/webrtc/config');
-        if (res.ok) {
-          const data = await res.json() as { iceServers?: RTCIceServer[]; hasTurn?: boolean; notice?: string };
-          if (data.iceServers && Array.isArray(data.iceServers) && data.iceServers.length > 0) {
-            rtcConfigRef.current = {
-              iceServers: data.iceServers,
-              iceCandidatePoolSize: 10,
-            };
-            isRtcConfigLoadedRef.current = true;
-            console.log(`[WebRTC] Loaded ${data.iceServers.length} ICE servers from backend. TURN active: ${!!data.hasTurn}`);
-            if (data.notice) {
-              console.info(`[WebRTC] Note: ${data.notice}`);
-            }
-          }
-        }
-      } catch (err) {
-        console.warn('[WebRTC] Failed to fetch /api/webrtc/config, using default STUN fallback:', err);
-      }
-    }
-    loadIceConfig();
-    return () => {
-      isMounted = false;
-    };
-  }, []);
+    if (!roomId || !myPlayerId) return;
 
-  // Monitor speaking volume of local mic
-  const setupAudioMonitoring = (stream: MediaStream) => {
-    try {
-      if (audioContextRef.current) {
-        audioContextRef.current.close().catch(() => {});
-      }
-      const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      const ctx = new AudioCtx();
-      const source = ctx.createMediaStreamSource(stream);
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 256;
-      source.connect(analyser);
+    let isCancelled = false;
 
-      audioContextRef.current = ctx;
-      analyserRef.current = analyser;
-
-      const buffer = new Uint8Array(analyser.frequencyBinCount);
-      const checkVolume = () => {
-        if (!analyserRef.current || !myPlayerId) return;
-        analyserRef.current.getByteFrequencyData(buffer);
-        let sum = 0;
-        for (let i = 0; i < buffer.length; i++) {
-          sum += buffer[i];
-        }
-        const avg = sum / buffer.length;
-        const isSpeaking = avg > 25;
-
-        setSpeakingPlayers(prev => {
-          const has = prev.has(myPlayerId);
-          if (isSpeaking && !has) {
-            socket.emit('media:speaking' as any, { roomId, isSpeaking: true });
-            const next = new Set(prev);
-            next.add(myPlayerId);
-            return next;
-          } else if (!isSpeaking && has) {
-            socket.emit('media:speaking' as any, { roomId, isSpeaking: false });
-            const next = new Set(prev);
-            next.delete(myPlayerId);
-            return next;
-          }
-          return prev;
-        });
-
-        animFrameRef.current = requestAnimationFrame(checkVolume);
-      };
-
-      checkVolume();
-    } catch {
-      // AudioContext optional
-    }
-  };
-
-  // Helper to drain buffered candidates after remote description is set
-  const drainCandidateQueue = async (targetId: string, pc: RTCPeerConnection) => {
-    const queue = candidateQueueRef.current.get(targetId) || [];
-    while (queue.length > 0) {
-      const cand = queue.shift();
-      if (cand) {
-        try {
-          await pc.addIceCandidate(new RTCIceCandidate(cand));
-        } catch (e) {
-          console.warn(`[WebRTC] Error adding queued ICE candidate for ${targetId}:`, e);
-        }
-      }
-    }
-  };
-
-  // Helper to attach or update remote audio stream
-  const attachOrUpdateRemoteAudio = useCallback((targetPlayerId: string, pc: RTCPeerConnection) => {
-    const audioReceiver = pc.getReceivers().find(r => r.track && r.track.kind === 'audio');
-    if (!audioReceiver || !audioReceiver.track) return;
-
-    const track = audioReceiver.track;
-    let audioEl = remoteAudioElementsRef.current.get(targetPlayerId);
-
-    if (!audioEl) {
-      audioEl = document.createElement('audio');
-      audioEl.autoplay = true;
-      // @ts-expect-error - playsInline is required for iOS WebKit
-      audioEl.playsInline = true;
-      // Offscreen positioning keeps WebKit audio rendering pipeline active (unlike display: none)
-      audioEl.style.position = 'fixed';
-      audioEl.style.top = '-9999px';
-      audioEl.style.left = '-9999px';
-      audioEl.style.width = '1px';
-      audioEl.style.height = '1px';
-      audioEl.style.opacity = '0.01';
-      audioEl.style.pointerEvents = 'none';
-      document.body.appendChild(audioEl);
-      remoteAudioElementsRef.current.set(targetPlayerId, audioEl);
-    }
-
-    const currentStream = audioEl.srcObject as MediaStream | null;
-    const hasCurrentTrack = currentStream?.getAudioTracks().some(t => t.id === track.id);
-    if (!hasCurrentTrack) {
-      audioEl.srcObject = new MediaStream([track]);
-      console.log(`[WebRTC] Attached remote audio track for ${targetPlayerId}`);
-    }
-
-    audioEl.muted = false;
-    audioEl.volume = 1.0;
-    audioEl.play().catch(e => {
-      console.warn(`[WebRTC] Audio autoplay blocked for ${targetPlayerId} (awaiting user gesture):`, e);
-    });
-
-    track.onunmute = () => {
-      console.log(`[WebRTC] Remote audio track unmuted for ${targetPlayerId}`);
-      if (audioEl) {
-        audioEl.muted = false;
-        audioEl.play().catch(() => {});
-      }
-    };
-  }, []);
-
-  // Helper to attach or update remote video stream
-  const attachOrUpdateRemoteVideo = useCallback((targetPlayerId: string, pc: RTCPeerConnection) => {
-    const videoReceiver = pc.getReceivers().find(r => r.track && r.track.kind === 'video');
-    if (!videoReceiver || !videoReceiver.track) return;
-
-    const track = videoReceiver.track;
-
-    setRemoteStreams(prev => {
-      const existing = prev.get(targetPlayerId);
-      // If we already have this exact track in the stream, do not trigger an unnecessary re-render
-      if (existing && existing.getVideoTracks().some(t => t.id === track.id)) {
-        return prev;
-      }
-      const next = new Map(prev);
-      next.set(targetPlayerId, new MediaStream([track]));
-      console.log(`[WebRTC] Attached remote video track for ${targetPlayerId} (track ID: ${track.id})`);
-      return next;
-    });
-
-    track.onunmute = () => {
-      console.log(`[WebRTC] Remote video track unmuted for ${targetPlayerId} (receiving video frames)`);
-      setRemoteStreams(prev => {
-        const next = new Map(prev);
-        next.set(targetPlayerId, new MediaStream([track]));
-        return next;
-      });
-    };
-
-    track.onmute = () => {
-      console.log(`[WebRTC] Remote video track muted for ${targetPlayerId} (video frames stopped)`);
-    };
-
-    track.onended = () => {
-      console.log(`[WebRTC] Remote video track ended for ${targetPlayerId}`);
-      setRemoteStreams(prev => {
-        const next = new Map(prev);
-        next.delete(targetPlayerId);
-        return next;
-      });
-    };
-  }, []);
-
-  // Create or get RTCPeerConnection for a target player
-  const getOrCreatePeerConnection = useCallback((targetPlayerId: string): RTCPeerConnection => {
-    let pc = peersRef.current.get(targetPlayerId);
-    if (pc && pc.connectionState !== 'closed' && pc.connectionState !== 'failed') {
-      return pc;
-    }
-
-    if (pc) {
-      try { pc.close(); } catch {}
-    }
-
-    pc = new RTCPeerConnection(rtcConfigRef.current);
-    makingOfferRef.current.set(targetPlayerId, false);
-    ignoreOfferRef.current.set(targetPlayerId, false);
-
-    // Initialize bidirectional audio/video transceivers or attach active local tracks
-    try {
-      const audioTrack = localAudioStreamRef.current?.getAudioTracks()[0];
-      if (audioTrack && localAudioStreamRef.current) {
-        pc.addTrack(audioTrack, localAudioStreamRef.current);
-      } else {
-        pc.addTransceiver('audio', { direction: 'recvonly' });
-      }
-
-      const videoTrack = localVideoStreamRef.current?.getVideoTracks()[0];
-      if (videoTrack && localVideoStreamRef.current) {
-        pc.addTrack(videoTrack, localVideoStreamRef.current);
-      } else {
-        pc.addTransceiver('video', { direction: 'recvonly' });
-      }
-    } catch (e) {
-      console.warn('[WebRTC] Transceiver setup note:', e);
-    }
-
-    pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        console.log(`[WebRTC] Generated ICE candidate for ${targetPlayerId} (type: ${event.candidate.type}, protocol: ${event.candidate.protocol})`);
-        socket.emit('webrtc:signal', {
-          roomId,
-          targetPlayerId,
-          signal: { type: 'candidate', candidate: event.candidate.toJSON() },
-        });
-      }
-    };
-
-    pc.oniceconnectionstatechange = async () => {
-      console.log(`[WebRTC] ICE connection state with ${targetPlayerId}: ${pc?.iceConnectionState}`);
-      if (pc?.iceConnectionState === 'failed') {
-        const isPolite = myPlayerId ? myPlayerId > targetPlayerId : false;
-        if (isPolite) {
-          console.warn(`[WebRTC] ICE failed with ${targetPlayerId}, polite peer attempting ICE restart...`);
-          try {
-            pc.restartIce();
-            const offer = await pc.createOffer({ iceRestart: true });
-            await pc.setLocalDescription(offer);
-            socket.emit('webrtc:signal', {
-              roomId,
-              targetPlayerId,
-              signal: offer,
-            });
-          } catch (e) {
-            console.warn('[WebRTC] ICE restart offer error:', e);
-          }
-        }
-      }
-    };
-
-    pc.onconnectionstatechange = () => {
-      console.log(`[WebRTC] Peer connection state with ${targetPlayerId}: ${pc?.connectionState}`);
-    };
-
-    pc.ontrack = (event) => {
-      console.log(`[WebRTC] ontrack fired from ${targetPlayerId} (kind: ${event.track.kind})`);
-      if (event.track.kind === 'audio') {
-        attachOrUpdateRemoteAudio(targetPlayerId, pc!);
-      }
-      if (event.track.kind === 'video') {
-        attachOrUpdateRemoteVideo(targetPlayerId, pc!);
-      }
-    };
-
-    peersRef.current.set(targetPlayerId, pc);
-    return pc;
-  }, [attachOrUpdateRemoteAudio, attachOrUpdateRemoteVideo, myPlayerId, roomId, socket]);
-
-  // Clean up a specific peer's connection, audio element, and media state
-  const cleanupPeer = useCallback((playerId: string) => {
-    console.log(`[WebRTC] Cleaning up peer ${playerId}`);
-    const pc = peersRef.current.get(playerId);
-    if (pc) {
-      try { pc.close(); } catch {}
-      peersRef.current.delete(playerId);
-    }
-    candidateQueueRef.current.delete(playerId);
-    makingOfferRef.current.delete(playerId);
-    ignoreOfferRef.current.delete(playerId);
-
-    const audioEl = remoteAudioElementsRef.current.get(playerId);
-    if (audioEl) {
-      audioEl.pause();
-      audioEl.srcObject = null;
-      if (audioEl.parentNode) {
-        audioEl.parentNode.removeChild(audioEl);
-      }
-      remoteAudioElementsRef.current.delete(playerId);
-    }
-
-    setRemoteStreams(prev => {
-      if (!prev.has(playerId)) return prev;
-      const next = new Map(prev);
-      next.delete(playerId);
-      return next;
-    });
-
-    setRemoteMediaStatus(prev => {
-      if (!prev.has(playerId)) return prev;
-      const next = new Map(prev);
-      next.delete(playerId);
-      return next;
-    });
-
-    setSpeakingPlayers(prev => {
-      if (!prev.has(playerId)) return prev;
-      const next = new Set(prev);
-      next.delete(playerId);
-      return next;
-    });
-  }, []);
-
-  // Handle incoming signaling messages
-  useEffect(() => {
-    const onSignal = async (data: { senderPlayerId: string; signal: any }) => {
-      if (!myPlayerId || data.senderPlayerId === myPlayerId) return;
-
-      const { senderPlayerId, signal } = data;
-      const pc = getOrCreatePeerConnection(senderPlayerId);
+    async function initLiveKit() {
+      if (isConnectingRef.current || roomRef.current) return;
+      isConnectingRef.current = true;
 
       try {
-        if (signal.type === 'offer') {
-          const isPolite = myPlayerId > senderPlayerId;
-          const makingOffer = makingOfferRef.current.get(senderPlayerId) || false;
-          const offerCollision = pc.signalingState !== 'stable' || makingOffer;
+        const session = loadSession();
+        const sessionToken = session?.sessionToken;
+        const userId = session?.userId || getOrCreateUserId();
 
-          ignoreOfferRef.current.set(senderPlayerId, !isPolite && offerCollision);
-          if (ignoreOfferRef.current.get(senderPlayerId)) {
-            console.log(`[WebRTC] Impolite peer ignoring colliding offer from ${senderPlayerId}`);
-            return;
-          }
+        console.log(`[LiveKit] Requesting access token for room "${roomId}", player "${myPlayerId}"`);
 
-          if (offerCollision && isPolite) {
-            console.log(`[WebRTC] Polite peer rolling back colliding offer with ${senderPlayerId}`);
-            await pc.setLocalDescription({ type: 'rollback' } as any);
-          }
-
-          await pc.setRemoteDescription(new RTCSessionDescription(signal));
-          await drainCandidateQueue(senderPlayerId, pc);
-
-          attachOrUpdateRemoteAudio(senderPlayerId, pc);
-          attachOrUpdateRemoteVideo(senderPlayerId, pc);
-
-          // If we have active local tracks, attach them to existing transceivers before creating answer
-          if (localAudioStreamRef.current) {
-            const at = localAudioStreamRef.current.getAudioTracks()[0];
-            const audioTransceiver = pc.getTransceivers().find(
-              t => t.receiver.track.kind === 'audio' || t.sender.track?.kind === 'audio'
-            );
-            if (audioTransceiver && at) {
-              audioTransceiver.direction = 'sendrecv';
-              await audioTransceiver.sender.replaceTrack(at);
-            }
-          }
-
-          if (localVideoStreamRef.current) {
-            const vt = localVideoStreamRef.current.getVideoTracks()[0];
-            const videoTransceiver = pc.getTransceivers().find(
-              t => t.receiver.track.kind === 'video' || t.sender.track?.kind === 'video'
-            );
-            if (videoTransceiver && vt) {
-              videoTransceiver.direction = 'sendrecv';
-              await videoTransceiver.sender.replaceTrack(vt);
-            }
-          }
-
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-
-          socket.emit('webrtc:signal', {
+        const res = await fetch('/api/livekit/token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
             roomId,
-            targetPlayerId: senderPlayerId,
-            signal: answer,
-          });
-        } else if (signal.type === 'answer') {
-          await pc.setRemoteDescription(new RTCSessionDescription(signal));
-          await drainCandidateQueue(senderPlayerId, pc);
+            playerId: myPlayerId,
+            sessionToken,
+            userId,
+          }),
+        });
 
-          attachOrUpdateRemoteAudio(senderPlayerId, pc);
-          attachOrUpdateRemoteVideo(senderPlayerId, pc);
-        } else if (signal.type === 'candidate' && signal.candidate) {
-          if (!pc.remoteDescription || !pc.remoteDescription.type) {
-            if (!candidateQueueRef.current.has(senderPlayerId)) {
-              candidateQueueRef.current.set(senderPlayerId, []);
-            }
-            candidateQueueRef.current.get(senderPlayerId)!.push(signal.candidate);
+        if (isCancelled) return;
+
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          if (res.status === 503) {
+            console.info('[LiveKit] Service notice:', errData.error || 'LiveKit credentials not configured on server.');
+            // Do not display an aggressive error banner during normal gameplay if LiveKit credentials aren't set yet
           } else {
-            try {
-              await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
-            } catch (err) {
-              if (!ignoreOfferRef.current.get(senderPlayerId)) {
-                console.warn(`[WebRTC] Candidate error for ${senderPlayerId}:`, err);
+            console.warn('[LiveKit] Token request failed:', res.status, errData);
+          }
+          isConnectingRef.current = false;
+          return;
+        }
+
+        const data = (await res.json()) as { token: string; serverUrl: string };
+        if (isCancelled) return;
+
+        const room = new Room({
+          adaptiveStream: true,
+          dynacast: true,
+        });
+
+        // ─── Track Subscribed: remote player published camera or microphone ───
+        room.on(
+          RoomEvent.TrackSubscribed,
+          (track: RemoteTrack, publication: RemoteTrackPublication, participant: RemoteParticipant) => {
+            const pid = participant.identity;
+            console.log(`[LiveKit] TrackSubscribed from "${pid}": kind=${track.kind}, muted=${publication.isMuted}`);
+
+            if (track.kind === Track.Kind.Video) {
+              const stream = new MediaStream([track.mediaStreamTrack]);
+              setRemoteStreams((prev) => {
+                const next = new Map(prev);
+                next.set(pid, stream);
+                return next;
+              });
+
+              setRemoteMediaStatus((prev) => {
+                const next = new Map(prev);
+                const current = next.get(pid) || { cameraEnabled: false, micEnabled: false };
+                next.set(pid, { ...current, cameraEnabled: !publication.isMuted });
+                return next;
+              });
+            } else if (track.kind === Track.Kind.Audio) {
+              // Attach audio element to DOM for unmuted remote playback without feedback loop
+              const audioEl = track.attach();
+              audioEl.autoplay = true;
+              attachedAudioElementsRef.current.set(`${pid}_audio`, audioEl);
+
+              setRemoteMediaStatus((prev) => {
+                const next = new Map(prev);
+                const current = next.get(pid) || { cameraEnabled: false, micEnabled: false };
+                next.set(pid, { ...current, micEnabled: !publication.isMuted });
+                return next;
+              });
+            }
+          }
+        );
+
+        // ─── Track Unsubscribed: remote player turned off camera/mic ─────────
+        room.on(
+          RoomEvent.TrackUnsubscribed,
+          (track: RemoteTrack, _publication: RemoteTrackPublication, participant: RemoteParticipant) => {
+            const pid = participant.identity;
+            console.log(`[LiveKit] TrackUnsubscribed from "${pid}": kind=${track.kind}`);
+
+            if (track.kind === Track.Kind.Video) {
+              setRemoteStreams((prev) => {
+                const next = new Map(prev);
+                next.delete(pid);
+                return next;
+              });
+
+              setRemoteMediaStatus((prev) => {
+                const next = new Map(prev);
+                const current = next.get(pid);
+                if (current) {
+                  next.set(pid, { ...current, cameraEnabled: false });
+                }
+                return next;
+              });
+            } else if (track.kind === Track.Kind.Audio) {
+              track.detach();
+              const existingEl = attachedAudioElementsRef.current.get(`${pid}_audio`);
+              if (existingEl) {
+                existingEl.remove();
+                attachedAudioElementsRef.current.delete(`${pid}_audio`);
+              }
+
+              setRemoteMediaStatus((prev) => {
+                const next = new Map(prev);
+                const current = next.get(pid);
+                if (current) {
+                  next.set(pid, { ...current, micEnabled: false });
+                }
+                return next;
+              });
+            }
+          }
+        );
+
+        // ─── Track Muted / Unmuted Events ────────────────────────────────────
+        room.on(RoomEvent.TrackMuted, (publication: TrackPublication, participant: Participant) => {
+          const pid = participant.identity;
+          setRemoteMediaStatus((prev) => {
+            const next = new Map(prev);
+            const current = next.get(pid) || { cameraEnabled: false, micEnabled: false };
+            if (publication.kind === Track.Kind.Video) {
+              next.set(pid, { ...current, cameraEnabled: false });
+            } else if (publication.kind === Track.Kind.Audio) {
+              next.set(pid, { ...current, micEnabled: false });
+            }
+            return next;
+          });
+        });
+
+        room.on(RoomEvent.TrackUnmuted, (publication: TrackPublication, participant: Participant) => {
+          const pid = participant.identity;
+          setRemoteMediaStatus((prev) => {
+            const next = new Map(prev);
+            const current = next.get(pid) || { cameraEnabled: false, micEnabled: false };
+            if (publication.kind === Track.Kind.Video) {
+              next.set(pid, { ...current, cameraEnabled: true });
+            } else if (publication.kind === Track.Kind.Audio) {
+              next.set(pid, { ...current, micEnabled: true });
+            }
+            return next;
+          });
+        });
+
+        // ─── Active Speakers: Visual Speaking Pulse Indicator ───────────────
+        room.on(RoomEvent.ActiveSpeakersChanged, (speakers: Participant[]) => {
+          const speakingSet = new Set<string>();
+          for (const s of speakers) {
+            if (s.identity) speakingSet.add(s.identity);
+          }
+          if (room.localParticipant.isSpeaking && myPlayerId) {
+            speakingSet.add(myPlayerId);
+          }
+          setSpeakingPlayers(speakingSet);
+        });
+
+        // ─── Remote Participant Left ─────────────────────────────────────────
+        room.on(RoomEvent.ParticipantDisconnected, (participant: RemoteParticipant) => {
+          const pid = participant.identity;
+          console.log(`[LiveKit] Participant disconnected: "${pid}"`);
+
+          setRemoteStreams((prev) => {
+            const next = new Map(prev);
+            next.delete(pid);
+            return next;
+          });
+
+          setRemoteMediaStatus((prev) => {
+            const next = new Map(prev);
+            next.delete(pid);
+            return next;
+          });
+
+          setSpeakingPlayers((prev) => {
+            const next = new Set(prev);
+            next.delete(pid);
+            return next;
+          });
+
+          const existingEl = attachedAudioElementsRef.current.get(`${pid}_audio`);
+          if (existingEl) {
+            existingEl.remove();
+            attachedAudioElementsRef.current.delete(`${pid}_audio`);
+          }
+        });
+
+        // ─── Connect to LiveKit SFU ──────────────────────────────────────────
+        await room.connect(data.serverUrl, data.token);
+        if (isCancelled) {
+          room.disconnect();
+          return;
+        }
+
+        roomRef.current = room;
+        console.log(`[LiveKit] Connected successfully to room "${room.name}" as "${myPlayerId}"`);
+
+        // Check if existing participants already published active tracks
+        room.remoteParticipants.forEach((participant) => {
+          const pid = participant.identity;
+          participant.trackPublications.forEach((pub) => {
+            if (pub.isSubscribed && pub.track) {
+              if (pub.track.kind === Track.Kind.Video) {
+                const stream = new MediaStream([pub.track.mediaStreamTrack]);
+                setRemoteStreams((prev) => new Map(prev).set(pid, stream));
+                setRemoteMediaStatus((prev) => {
+                  const next = new Map(prev);
+                  const current = next.get(pid) || { cameraEnabled: false, micEnabled: false };
+                  return next.set(pid, { ...current, cameraEnabled: !pub.isMuted });
+                });
+              } else if (pub.track.kind === Track.Kind.Audio) {
+                const audioEl = pub.track.attach();
+                audioEl.autoplay = true;
+                attachedAudioElementsRef.current.set(`${pid}_audio`, audioEl);
+                setRemoteMediaStatus((prev) => {
+                  const next = new Map(prev);
+                  const current = next.get(pid) || { cameraEnabled: false, micEnabled: false };
+                  return next.set(pid, { ...current, micEnabled: !pub.isMuted });
+                });
               }
             }
-          }
-        }
-      } catch (err) {
-        console.warn('[WebRTC] Signal handling exception:', err);
-      }
-    };
-
-    const onMediaStatus = (data: { playerId: string; cameraEnabled: boolean; micEnabled: boolean }) => {
-      console.log(`[WebRTC] Received media:player_status from ${data.playerId}:`, data);
-      setRemoteMediaStatus(prev => {
-        const next = new Map(prev);
-        next.set(data.playerId, { cameraEnabled: data.cameraEnabled, micEnabled: data.micEnabled });
-        return next;
-      });
-
-      const pc = peersRef.current.get(data.playerId);
-      const audioEl = remoteAudioElementsRef.current.get(data.playerId);
-
-      if (data.micEnabled) {
-        if (pc) {
-          attachOrUpdateRemoteAudio(data.playerId, pc);
-        }
-        if (audioEl) {
-          audioEl.muted = false;
-          audioEl.play().catch(() => {});
-        }
-      } else {
-        if (audioEl) {
-          audioEl.muted = true;
-        }
-      }
-
-      if (!data.cameraEnabled) {
-        // If remote peer turned off camera, clear remote video stream
-        setRemoteStreams(prev => {
-          if (!prev.has(data.playerId)) return prev;
-          const next = new Map(prev);
-          next.delete(data.playerId);
-          return next;
+          });
         });
+      } catch (err: any) {
+        console.warn('[LiveKit] Connection error:', err?.message || err);
+      } finally {
+        isConnectingRef.current = false;
       }
-    };
-
-    const onSpeaking = (data: { playerId: string; isSpeaking: boolean }) => {
-      setSpeakingPlayers(prev => {
-        const has = prev.has(data.playerId);
-        if (data.isSpeaking && !has) {
-          const next = new Set(prev);
-          next.add(data.playerId);
-          return next;
-        } else if (!data.isSpeaking && has) {
-          const next = new Set(prev);
-          next.delete(data.playerId);
-          return next;
-        }
-        return prev;
-      });
-    };
-
-    const onPlayerLeft = (data: { playerId: string }) => {
-      cleanupPeer(data.playerId);
-    };
-
-    socket.on('webrtc:signal', onSignal);
-    socket.on('media:player_status' as any, onMediaStatus as any);
-    socket.on('media:player_speaking' as any, onSpeaking as any);
-    socket.on('room:player_left', onPlayerLeft);
-
-    return () => {
-      socket.off('webrtc:signal', onSignal);
-      socket.off('media:player_status' as any, onMediaStatus as any);
-      socket.off('media:player_speaking' as any, onSpeaking as any);
-      socket.off('room:player_left', onPlayerLeft);
-    };
-  }, [attachOrUpdateRemoteAudio, attachOrUpdateRemoteVideo, cleanupPeer, getOrCreatePeerConnection, myPlayerId, roomId, socket]);
-
-  // Toggle microphone (with Hardware/Browser Acoustic Echo Cancellation enabled!)
-  const toggleMic = async () => {
-    if (micEnabled) {
-      if (localAudioStreamRef.current) {
-        localAudioStreamRef.current.getTracks().forEach(t => t.stop());
-        localAudioStreamRef.current = null;
-      }
-      if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
-      if (audioContextRef.current) audioContextRef.current.close().catch(() => {});
-
-      // Replace audio track with null and renegotiate direction
-      peersRef.current.forEach(async (pc, targetId) => {
-        const audioTransceiver = pc.getTransceivers().find(
-          t => t.receiver.track.kind === 'audio' || t.sender.track?.kind === 'audio'
-        );
-        if (audioTransceiver) {
-          await audioTransceiver.sender.replaceTrack(null);
-          audioTransceiver.direction = 'recvonly';
-        }
-        if (pc.signalingState === 'stable') {
-          try {
-            makingOfferRef.current.set(targetId, true);
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
-            socket.emit('webrtc:signal', { roomId, targetPlayerId: targetId, signal: offer });
-          } catch (e) {
-            console.warn('[WebRTC] Mic stop renegotiation error:', e);
-          } finally {
-            makingOfferRef.current.set(targetId, false);
-          }
-        }
-      });
-
-      if (myPlayerId) {
-        setSpeakingPlayers(prev => {
-          const next = new Set(prev);
-          next.delete(myPlayerId);
-          return next;
-        });
-      }
-
-      setMicEnabled(false);
-      socket.emit('media:status', { roomId, cameraEnabled, micEnabled: false });
-      return;
     }
 
-    try {
-      // Acoustic Echo Cancellation, Noise Suppression, and Auto Gain Control prevent speaker loopback
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
+    initLiveKit();
+
+    return () => {
+      isCancelled = true;
+      if (roomRef.current) {
+        roomRef.current.disconnect();
+        roomRef.current = null;
+      }
+      attachedAudioElementsRef.current.forEach((el) => {
+        try {
+          el.pause();
+          el.remove();
+        } catch {}
+      });
+      attachedAudioElementsRef.current.clear();
+      isConnectingRef.current = false;
+    };
+  }, [roomId, myPlayerId]);
+
+  // ─── 2. Toggle Camera: Opt-in, stops hardware completely when off ───────────
+  const toggleCamera = useCallback(async () => {
+    setErrorMsg(null);
+
+    if (cameraEnabled) {
+      // Turn Camera OFF
+      try {
+        const room = roomRef.current;
+        if (room && localVideoTrackRef.current) {
+          await room.localParticipant.unpublishTrack(localVideoTrackRef.current);
+        }
+        if (localVideoTrackRef.current) {
+          localVideoTrackRef.current.stop();
+          localVideoTrackRef.current = null;
+        }
+        setLocalVideoStream(null);
+        setCameraEnabled(false);
+
+        // Notify socket for secondary room state sync
+        socket.emit('media:status', {
+          roomId,
+          cameraEnabled: false,
+          micEnabled,
+        });
+      } catch (err: any) {
+        console.error('[LiveKit] Error disabling camera:', err);
+      }
+    } else {
+      // Turn Camera ON
+      try {
+        const track = await createLocalVideoTrack({
+          resolution: VideoPresets.h360,
+          facingMode: 'user',
+        });
+        localVideoTrackRef.current = track;
+
+        const stream = new MediaStream([track.mediaStreamTrack]);
+        setLocalVideoStream(stream);
+
+        const room = roomRef.current;
+        if (room) {
+          await room.localParticipant.publishTrack(track, {
+            name: 'camera',
+            simulcast: false,
+          });
+        }
+        setCameraEnabled(true);
+
+        socket.emit('media:status', {
+          roomId,
+          cameraEnabled: true,
+          micEnabled,
+        });
+      } catch (err: any) {
+        console.error('[LiveKit] Failed to enable camera:', err);
+        const msg =
+          err?.name === 'NotAllowedError'
+            ? 'Camera permission denied. Please allow camera access in your browser settings.'
+            : 'Camera could not be activated: ' + (err?.message || 'Device error');
+        setErrorMsg(msg);
+      }
+    }
+  }, [cameraEnabled, micEnabled, roomId, socket]);
+
+  // ─── 3. Toggle Microphone: Opt-in, stops hardware completely when off ───────
+  const toggleMic = useCallback(async () => {
+    setErrorMsg(null);
+
+    if (micEnabled) {
+      // Turn Mic OFF
+      try {
+        const room = roomRef.current;
+        if (room && localAudioTrackRef.current) {
+          await room.localParticipant.unpublishTrack(localAudioTrackRef.current);
+        }
+        if (localAudioTrackRef.current) {
+          localAudioTrackRef.current.stop();
+          localAudioTrackRef.current = null;
+        }
+        setMicEnabled(false);
+
+        socket.emit('media:status', {
+          roomId,
+          cameraEnabled,
+          micEnabled: false,
+        });
+      } catch (err: any) {
+        console.error('[LiveKit] Error disabling microphone:', err);
+      }
+    } else {
+      // Turn Mic ON
+      try {
+        const track = await createLocalAudioTrack({
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true,
-          sampleRate: 48000,
-          channelCount: 1,
-        },
-        video: false,
-      });
+        });
+        localAudioTrackRef.current = track;
 
-      localAudioStreamRef.current = stream;
-      setLocalStream(stream);
-      setMicEnabled(true);
-      setErrorMsg(null);
-
-      setupAudioMonitoring(stream);
-      socket.emit('media:status', { roomId, cameraEnabled, micEnabled: true });
-
-      const audioTrack = stream.getAudioTracks()[0];
-
-      // Update or add track to all other connected players and renegotiate
-      otherPlayerIds.forEach(async (targetId) => {
-        if (targetId === myPlayerId) return;
-        const pc = getOrCreatePeerConnection(targetId);
-        const audioTransceiver = pc.getTransceivers().find(
-          t => t.receiver.track.kind === 'audio' || t.sender.track?.kind === 'audio'
-        );
-
-        if (audioTransceiver) {
-          audioTransceiver.direction = 'sendrecv';
-          await audioTransceiver.sender.replaceTrack(audioTrack);
-        } else {
-          pc.addTrack(audioTrack, stream);
-        }
-
-        if (pc.signalingState === 'stable') {
-          try {
-            makingOfferRef.current.set(targetId, true);
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
-            socket.emit('webrtc:signal', {
-              roomId,
-              targetPlayerId: targetId,
-              signal: offer,
-            });
-          } catch (e) {
-            console.warn('[WebRTC] Mic offer creation error:', e);
-          } finally {
-            makingOfferRef.current.set(targetId, false);
-          }
-        }
-      });
-    } catch {
-      setErrorMsg('Microphone access denied or not available');
-      setMicEnabled(false);
-      setTimeout(() => setErrorMsg(null), 4000);
-    }
-  };
-
-  // Toggle Camera
-  const toggleCamera = async () => {
-    if (cameraEnabled) {
-      if (localVideoStreamRef.current) {
-        localVideoStreamRef.current.getTracks().forEach(t => t.stop());
-        localVideoStreamRef.current = null;
-      }
-      setLocalVideoStream(null);
-      setCameraEnabled(false);
-      socket.emit('media:status', { roomId, cameraEnabled: false, micEnabled });
-
-      // Replace video track with null and renegotiate direction
-      peersRef.current.forEach(async (pc, targetId) => {
-        const videoTransceiver = pc.getTransceivers().find(
-          t => t.receiver.track.kind === 'video' || t.sender.track?.kind === 'video'
-        );
-        if (videoTransceiver) {
-          await videoTransceiver.sender.replaceTrack(null);
-          videoTransceiver.direction = 'recvonly';
-        }
-        if (pc.signalingState === 'stable') {
-          try {
-            makingOfferRef.current.set(targetId, true);
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
-            socket.emit('webrtc:signal', { roomId, targetPlayerId: targetId, signal: offer });
-          } catch (e) {
-            console.warn('[WebRTC] Cam stop renegotiation error:', e);
-          } finally {
-            makingOfferRef.current.set(targetId, false);
-          }
-        }
-      });
-      return;
-    }
-
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          width: { ideal: 480, max: 640 },
-          height: { ideal: 360, max: 480 },
-          frameRate: { ideal: 24, max: 30 },
-          facingMode: 'user',
-        },
-        audio: false,
-      });
-
-      localVideoStreamRef.current = stream;
-      setLocalVideoStream(stream);
-      setCameraEnabled(true);
-      setErrorMsg(null);
-      socket.emit('media:status', { roomId, cameraEnabled: true, micEnabled });
-
-      const videoTrack = stream.getVideoTracks()[0];
-
-      // Connect to all peers, attach video track, and renegotiate
-      otherPlayerIds.forEach(async (targetId) => {
-        if (targetId === myPlayerId) return;
-        const pc = getOrCreatePeerConnection(targetId);
-        const videoTransceiver = pc.getTransceivers().find(
-          t => t.receiver.track.kind === 'video' || t.sender.track?.kind === 'video'
-        );
-
-        if (videoTransceiver) {
-          videoTransceiver.direction = 'sendrecv';
-          await videoTransceiver.sender.replaceTrack(videoTrack);
-        } else {
-          pc.addTrack(videoTrack, stream);
-        }
-
-        if (pc.signalingState === 'stable') {
-          try {
-            makingOfferRef.current.set(targetId, true);
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
-            socket.emit('webrtc:signal', {
-              roomId,
-              targetPlayerId: targetId,
-              signal: offer,
-            });
-          } catch (e) {
-            console.warn('[WebRTC] Cam offer creation error:', e);
-          } finally {
-            makingOfferRef.current.set(targetId, false);
-          }
-        }
-      });
-    } catch {
-      setErrorMsg('Camera access denied or not available');
-      setCameraEnabled(false);
-      setTimeout(() => setErrorMsg(null), 4000);
-    }
-  };
-
-  // Connect to newly joined peers ONLY (do not blast offers on every game state change)
-  useEffect(() => {
-    if (!myPlayerId) return;
-
-    // Check for players that left
-    const currentIdSet = new Set(otherPlayerIds);
-    for (const knownId of knownPeerIdsRef.current) {
-      if (!currentIdSet.has(knownId)) {
-        cleanupPeer(knownId);
-        knownPeerIdsRef.current.delete(knownId);
-      }
-    }
-
-    // Check for newly joined players
-    otherPlayerIds.forEach(async (targetId) => {
-      if (targetId === myPlayerId) return;
-      if (knownPeerIdsRef.current.has(targetId)) return; // Already initialized
-
-      knownPeerIdsRef.current.add(targetId);
-      const pc = getOrCreatePeerConnection(targetId);
-
-      // If local media is already active, attach tracks
-      if (localVideoStreamRef.current) {
-        const vt = localVideoStreamRef.current.getVideoTracks()[0];
-        const vTransceiver = pc.getTransceivers().find(
-          t => t.receiver.track.kind === 'video' || t.sender.track?.kind === 'video'
-        );
-        if (vTransceiver && vt) {
-          vTransceiver.direction = 'sendrecv';
-          await vTransceiver.sender.replaceTrack(vt);
-        }
-      }
-
-      if (localAudioStreamRef.current) {
-        const at = localAudioStreamRef.current.getAudioTracks()[0];
-        const aTransceiver = pc.getTransceivers().find(
-          t => t.receiver.track.kind === 'audio' || t.sender.track?.kind === 'audio'
-        );
-        if (aTransceiver && at) {
-          aTransceiver.direction = 'sendrecv';
-          await aTransceiver.sender.replaceTrack(at);
-        }
-      }
-
-      // Polite peer sends initial offer if connection is stable
-      const isPolite = myPlayerId > targetId;
-      if (isPolite && pc.signalingState === 'stable') {
-        try {
-          makingOfferRef.current.set(targetId, true);
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-          socket.emit('webrtc:signal', {
-            roomId,
-            targetPlayerId: targetId,
-            signal: offer,
+        const room = roomRef.current;
+        if (room) {
+          await room.localParticipant.publishTrack(track, {
+            name: 'microphone',
           });
-        } catch (e) {
-          console.warn('[WebRTC] Initial peer offer error:', e);
-        } finally {
-          makingOfferRef.current.set(targetId, false);
         }
-      }
-    });
-  }, [otherPlayerIds, cleanupPeer, getOrCreatePeerConnection, myPlayerId, roomId, socket]);
+        setMicEnabled(true);
 
-  // Auto-unlock audio playback on first user touch / click (mobile Safari & Chrome autoplay policy)
-  useEffect(() => {
-    const unlockAudio = () => {
-      if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
-        audioContextRef.current.resume().catch(() => {});
+        socket.emit('media:status', {
+          roomId,
+          cameraEnabled,
+          micEnabled: true,
+        });
+      } catch (err: any) {
+        console.error('[LiveKit] Failed to enable microphone:', err);
+        const msg =
+          err?.name === 'NotAllowedError'
+            ? 'Microphone permission denied. Please allow microphone access in your browser settings.'
+            : 'Microphone could not be activated: ' + (err?.message || 'Device error');
+        setErrorMsg(msg);
       }
-      peersRef.current.forEach((pc, pId) => {
-        attachOrUpdateRemoteAudio(pId, pc);
-      });
-      remoteAudioElementsRef.current.forEach(audioEl => {
-        audioEl.muted = false;
-        audioEl.play().catch(() => {});
-      });
-    };
-    window.addEventListener('click', unlockAudio, { passive: true });
-    window.addEventListener('touchstart', unlockAudio, { passive: true });
-    window.addEventListener('pointerdown', unlockAudio, { passive: true });
-    return () => {
-      window.removeEventListener('click', unlockAudio);
-      window.removeEventListener('touchstart', unlockAudio);
-      window.removeEventListener('pointerdown', unlockAudio);
-    };
-  }, [attachOrUpdateRemoteAudio]);
+    }
+  }, [cameraEnabled, micEnabled, roomId, socket]);
 
-  // Clean up all peers, audio elements, and media tracks on unmount
+  // ─── Cleanup on Unmount: guarantee hardware tracks are released ────────────
   useEffect(() => {
     return () => {
-      localAudioStreamRef.current?.getTracks().forEach(t => t.stop());
-      localVideoStreamRef.current?.getTracks().forEach(t => t.stop());
-      peersRef.current.forEach(pc => {
-        try { pc.close(); } catch {}
-      });
-      peersRef.current.clear();
-      candidateQueueRef.current.clear();
-      remoteAudioElementsRef.current.forEach(el => {
-        el.pause();
-        el.srcObject = null;
-        if (el.parentNode) {
-          el.parentNode.removeChild(el);
-        }
-      });
-      remoteAudioElementsRef.current.clear();
-      if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
-      if (audioContextRef.current) audioContextRef.current.close().catch(() => {});
+      if (localVideoTrackRef.current) {
+        localVideoTrackRef.current.stop();
+        localVideoTrackRef.current = null;
+      }
+      if (localAudioTrackRef.current) {
+        localAudioTrackRef.current.stop();
+        localAudioTrackRef.current = null;
+      }
     };
   }, []);
 
   return {
     micEnabled,
     cameraEnabled,
-    localStream,
+    localStream: localVideoStream,
     localVideoStream,
     remoteStreams,
     remoteMediaStatus,
