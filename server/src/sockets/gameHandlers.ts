@@ -90,6 +90,8 @@ export function registerSocketHandlers(io: LudoServer, roomManager: RoomManager)
         });
 
         socket.join(room.roomId);
+      socket.join(`player:${player.playerId}`);
+        socket.join(`player:${player.playerId}`);
 
         const gameState: GameState = {
           roomId: room.roomId,
@@ -163,6 +165,7 @@ export function registerSocketHandlers(io: LudoServer, roomManager: RoomManager)
       }
 
       socket.join(room.roomId);
+      socket.join(`player:${player.playerId}`);
       callback?.({ success: true });
 
       // Deliver the full current game state snapshot for reconnection
@@ -460,15 +463,11 @@ export function registerSocketHandlers(io: LudoServer, roomManager: RoomManager)
       if (!entry) return;
 
       if (data.targetPlayerId) {
-        // Unicast signal to a specific player
-        const room = roomManager.getRoom(data.roomId);
-        const target = room?.players.find(p => p.playerId === data.targetPlayerId);
-        if (target) {
-          io.to(target.socketId).emit('webrtc:signal', {
-            senderPlayerId: entry.player.playerId,
-            signal: data.signal,
-          });
-        }
+        // Direct unicast signal to player's private channel
+        io.to(`player:${data.targetPlayerId}`).emit('webrtc:signal', {
+          senderPlayerId: entry.player.playerId,
+          signal: data.signal,
+        });
       } else {
         // Broadcast signal to whole room except sender
         socket.to(data.roomId).emit('webrtc:signal', {

@@ -58,17 +58,21 @@ export function IntegratedPlayerDiceStation({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const color = PLAYER_COLORS[player.color] || PLAYER_COLORS.red;
 
-  // Stream video track attach
+  // Stream video track attach with explicit play() trigger
   useEffect(() => {
-    if (videoRef.current && stream) {
-      videoRef.current.srcObject = stream;
-    } else if (videoRef.current && !stream) {
-      videoRef.current.srcObject = null;
+    const video = videoRef.current;
+    if (!video) return;
+
+    if (stream && stream.getVideoTracks().length > 0) {
+      video.srcObject = stream;
+      video.play().catch(() => {});
+    } else {
+      video.srcObject = null;
     }
   }, [stream]);
 
-  const hasActiveVideo = stream && stream.getVideoTracks().some((t) => t.readyState === 'live' && t.enabled);
-  const isCameraActive = isMe ? !!cameraEnabled : !!isRemoteCameraOn || !!hasActiveVideo;
+  const hasActiveVideo = Boolean(stream && stream.getVideoTracks().some((t) => t.readyState === 'live' && t.enabled));
+  const isCameraActive = isMe ? !!cameraEnabled : !!isRemoteCameraOn || hasActiveVideo;
 
   const canRollNow = isActive && turnPhase === 'WAITING_FOR_ROLL' && isMe && !isRolling;
   const showDiceSlot = isActive || currentDice !== null;
@@ -115,7 +119,7 @@ export function IntegratedPlayerDiceStation({
               ref={videoRef}
               autoPlay
               playsInline
-              muted={isMe}
+              muted
               className="w-full h-full object-cover"
             />
           ) : isCameraActive ? (

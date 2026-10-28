@@ -14,6 +14,26 @@ export interface UseMediaChatReturn {
   errorMsg: string | null;
 }
 
+// Robust STUN + Free OpenRelay TURN servers for cross-network / mobile cellular NAT traversal (4G/5G/WAN)
+const RTC_CONFIG: RTCConfiguration = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
+    { urls: 'stun:stun.cloudflare.com:3478' },
+    {
+      urls: [
+        'turn:openrelay.metered.ca:80',
+        'turn:openrelay.metered.ca:443',
+        'turn:openrelay.metered.ca:443?transport=tcp',
+      ],
+      username: 'openrelay',
+      credential: 'openrelay',
+    },
+  ],
+  iceCandidatePoolSize: 10,
+};
+
 export function useMediaChat(
   roomId: string,
   myPlayerId: string | null,
@@ -32,15 +52,23 @@ export function useMediaChat(
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
 
   const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map());
+  // Queue ICE candidates that arrive before setRemoteDescription finishes
+  const candidateQueueRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
+  // Dedicated audio elements per remote peer to eliminate reverb / echo loops
+  const remoteAudioElementsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
+
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const animFrameRef = useRef<number | null>(null);
 
   const socket = getSocket();
 
-  // Monitor speaking levels of local player
+  // Monitor speaking volume of local mic
   const setupAudioMonitoring = (stream: MediaStream) => {
     try {
+      if (audioContextRef.current) {
+        audioContextRef.current.close().catch(() => {});
+      }
       const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
       const ctx = new AudioCtx();
       const source = ctx.createMediaStreamSource(stream);
@@ -85,26 +113,44 @@ export function useMediaChat(
     }
   };
 
+  // Helper to drain buffered candidates after remote description is set
+  const drainCandidateQueue = async (targetId: string, pc: RTCPeerConnection) => {
+    const queue = candidateQueueRef.current.get(targetId) || [];
+    while (queue.length > 0) {
+      const cand = queue.shift();
+      if (cand) {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(cand));
+        } catch (e) {
+          console.warn('Error adding queued ICE candidate:', e);
+        }
+      }
+    }
+  };
+
+  // Create or get RTCPeerConnection for a target player
   const getOrCreatePeerConnection = useCallback((targetPlayerId: string): RTCPeerConnection => {
     let pc = peersRef.current.get(targetPlayerId);
     if (pc && pc.connectionState !== 'closed' && pc.connectionState !== 'failed') {
       return pc;
     }
 
-    pc = new RTCPeerConnection({
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-      ],
-    });
+    if (pc) {
+      try { pc.close(); } catch {}
+    }
 
+    pc = new RTCPeerConnection(RTC_CONFIG);
+
+    // Attach active local audio tracks if enabled
     if (localAudioStreamRef.current) {
-      localAudioStreamRef.current.getTracks().forEach(track => {
+      localAudioStreamRef.current.getAudioTracks().forEach(track => {
         pc!.addTrack(track, localAudioStreamRef.current!);
       });
     }
+
+    // Attach active local video tracks if enabled
     if (localVideoStreamRef.current) {
-      localVideoStreamRef.current.getTracks().forEach(track => {
+      localVideoStreamRef.current.getVideoTracks().forEach(track => {
         pc!.addTrack(track, localVideoStreamRef.current!);
       });
     }
@@ -114,31 +160,51 @@ export function useMediaChat(
         socket.emit('webrtc:signal', {
           roomId,
           targetPlayerId,
-          signal: { type: 'candidate', candidate: event.candidate },
+          signal: { type: 'candidate', candidate: event.candidate.toJSON() },
         });
       }
     };
 
-    pc.ontrack = (event) => {
-      const stream = event.streams[0] || new MediaStream([event.track]);
-      setRemoteStreams(prev => {
-        const next = new Map(prev);
-        const existing = next.get(targetPlayerId);
-        if (existing) {
-          if (!existing.getTracks().some(t => t.id === event.track.id)) {
-            existing.addTrack(event.track);
-          }
-          next.set(targetPlayerId, new MediaStream(existing.getTracks()));
-        } else {
-          next.set(targetPlayerId, stream);
-        }
-        return next;
-      });
+    pc.oniceconnectionstatechange = () => {
+      if (pc?.iceConnectionState === 'failed') {
+        console.warn(`[WebRTC] ICE failed with ${targetPlayerId}, attempting ICE restart...`);
+        pc.restartIce();
+      }
+    };
 
-      if (event.track.kind === 'audio') {
-        const audio = new Audio();
-        audio.srcObject = new MediaStream([event.track]);
-        audio.play().catch(() => {});
+    pc.ontrack = (event) => {
+      const { track, streams } = event;
+      const stream = streams[0] || new MediaStream([track]);
+
+      if (track.kind === 'video') {
+        setRemoteStreams(prev => {
+          const next = new Map(prev);
+          let targetStream = next.get(targetPlayerId);
+          if (!targetStream) {
+            targetStream = new MediaStream();
+            next.set(targetPlayerId, targetStream);
+          }
+          // Remove old video tracks to avoid duplicates
+          targetStream.getVideoTracks().forEach(t => {
+            if (t.id !== track.id) targetStream!.removeTrack(t);
+          });
+          if (!targetStream.getTracks().some(t => t.id === track.id)) {
+            targetStream.addTrack(track);
+          }
+          return new Map(next);
+        });
+      }
+
+      if (track.kind === 'audio') {
+        // Use a single dedicated HTMLAudioElement per remote player with echo control
+        let audioEl = remoteAudioElementsRef.current.get(targetPlayerId);
+        if (!audioEl) {
+          audioEl = new Audio();
+          audioEl.autoplay = true;
+          remoteAudioElementsRef.current.set(targetPlayerId, audioEl);
+        }
+        audioEl.srcObject = new MediaStream([track]);
+        audioEl.play().catch(e => console.warn('Audio play autoplay policy:', e));
       }
     };
 
@@ -146,7 +212,7 @@ export function useMediaChat(
     return pc;
   }, [roomId, socket]);
 
-  // Handle incoming signaling messages and status updates
+  // Handle incoming signaling messages
   useEffect(() => {
     const onSignal = async (data: { senderPlayerId: string; signal: any }) => {
       if (!myPlayerId || data.senderPlayerId === myPlayerId) return;
@@ -156,7 +222,22 @@ export function useMediaChat(
 
       try {
         if (signal.type === 'offer') {
+          // Polite peer pattern: if both sent offers, polite peer rolls back
+          const isPolite = myPlayerId > senderPlayerId;
+          const offerCollision = pc.signalingState !== 'stable';
+
+          if (offerCollision && !isPolite) {
+            // Impolite peer ignores colliding offer
+            return;
+          }
+
+          if (offerCollision && isPolite) {
+            await pc.setLocalDescription({ type: 'rollback' } as any);
+          }
+
           await pc.setRemoteDescription(new RTCSessionDescription(signal));
+          await drainCandidateQueue(senderPlayerId, pc);
+
           const answer = await pc.createAnswer();
           await pc.setLocalDescription(answer);
 
@@ -167,11 +248,20 @@ export function useMediaChat(
           });
         } else if (signal.type === 'answer') {
           await pc.setRemoteDescription(new RTCSessionDescription(signal));
+          await drainCandidateQueue(senderPlayerId, pc);
         } else if (signal.type === 'candidate' && signal.candidate) {
-          await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
+          if (!pc.remoteDescription || !pc.remoteDescription.type) {
+            // Buffer candidate until remote description is applied
+            if (!candidateQueueRef.current.has(senderPlayerId)) {
+              candidateQueueRef.current.set(senderPlayerId, []);
+            }
+            candidateQueueRef.current.get(senderPlayerId)!.push(signal.candidate);
+          } else {
+            await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
+          }
         }
       } catch (err) {
-        console.warn('WebRTC signal handling:', err);
+        console.warn('[WebRTC] Signal handling exception:', err);
       }
     };
 
@@ -181,6 +271,15 @@ export function useMediaChat(
         next.set(data.playerId, { cameraEnabled: data.cameraEnabled, micEnabled: data.micEnabled });
         return next;
       });
+
+      // If remote player turned off mic, pause their audio element immediately to avoid residual sound
+      if (!data.micEnabled) {
+        const audioEl = remoteAudioElementsRef.current.get(data.playerId);
+        if (audioEl) {
+          audioEl.pause();
+          audioEl.srcObject = null;
+        }
+      }
     };
 
     socket.on('webrtc:signal', onSignal);
@@ -192,7 +291,7 @@ export function useMediaChat(
     };
   }, [getOrCreatePeerConnection, myPlayerId, roomId, socket]);
 
-  // Toggle microphone
+  // Toggle microphone (with Hardware/Browser Acoustic Echo Cancellation enabled!)
   const toggleMic = async () => {
     if (micEnabled) {
       if (localAudioStreamRef.current) {
@@ -201,6 +300,14 @@ export function useMediaChat(
       }
       if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
       if (audioContextRef.current) audioContextRef.current.close().catch(() => {});
+
+      // Replace audio track with null on all peers to mute instantly
+      peersRef.current.forEach(pc => {
+        const sender = pc.getSenders().find(s => s.track?.kind === 'audio');
+        if (sender) {
+          sender.replaceTrack(null);
+        }
+      });
 
       if (myPlayerId) {
         setSpeakingPlayers(prev => {
@@ -216,7 +323,16 @@ export function useMediaChat(
     }
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      // Acoustic Echo Cancellation, Noise Suppression, and Auto Gain Control prevent speaker loopback!
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: { ideal: true },
+          noiseSuppression: { ideal: true },
+          autoGainControl: { ideal: true },
+        },
+        video: false,
+      });
+
       localAudioStreamRef.current = stream;
       setLocalStream(stream);
       setMicEnabled(true);
@@ -225,18 +341,26 @@ export function useMediaChat(
       setupAudioMonitoring(stream);
       socket.emit('media:status', { roomId, cameraEnabled, micEnabled: true });
 
-      // Offer to all other connected players
+      const audioTrack = stream.getAudioTracks()[0];
+
+      // Update or add track to all other connected players
       otherPlayerIds.forEach(async (targetId) => {
         if (targetId === myPlayerId) return;
         const pc = getOrCreatePeerConnection(targetId);
-        stream.getAudioTracks().forEach(t => pc.addTrack(t, stream));
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        socket.emit('webrtc:signal', {
-          roomId,
-          targetPlayerId: targetId,
-          signal: offer,
-        });
+        const sender = pc.getSenders().find(s => s.track?.kind === 'audio');
+
+        if (sender) {
+          await sender.replaceTrack(audioTrack);
+        } else {
+          pc.addTrack(audioTrack, stream);
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          socket.emit('webrtc:signal', {
+            roomId,
+            targetPlayerId: targetId,
+            signal: offer,
+          });
+        }
       });
     } catch {
       setErrorMsg('Microphone access denied or not available');
@@ -256,20 +380,11 @@ export function useMediaChat(
       setCameraEnabled(false);
       socket.emit('media:status', { roomId, cameraEnabled: false, micEnabled });
 
-      // Remove video track from peers and notify
-      otherPlayerIds.forEach(async (targetId) => {
-        const pc = peersRef.current.get(targetId);
-        if (pc) {
-          pc.getSenders().forEach(s => {
-            if (s.track?.kind === 'video') pc.removeTrack(s);
-          });
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-          socket.emit('webrtc:signal', {
-            roomId,
-            targetPlayerId: targetId,
-            signal: offer,
-          });
+      // Replace video track with null on all peers to turn off video immediately
+      peersRef.current.forEach(pc => {
+        const sender = pc.getSenders().find(s => s.track?.kind === 'video');
+        if (sender) {
+          sender.replaceTrack(null);
         }
       });
       return;
@@ -278,8 +393,9 @@ export function useMediaChat(
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
-          width: { ideal: 360 },
-          height: { ideal: 270 },
+          width: { ideal: 480, max: 640 },
+          height: { ideal: 360, max: 480 },
+          frameRate: { ideal: 24, max: 30 },
           facingMode: 'user',
         },
         audio: false,
@@ -291,11 +407,20 @@ export function useMediaChat(
       setErrorMsg(null);
       socket.emit('media:status', { roomId, cameraEnabled: true, micEnabled });
 
-      // Connect to all peers and send offer
+      const videoTrack = stream.getVideoTracks()[0];
+
+      // Connect to all peers and attach video track
       otherPlayerIds.forEach(async (targetId) => {
         if (targetId === myPlayerId) return;
         const pc = getOrCreatePeerConnection(targetId);
-        stream.getVideoTracks().forEach(t => pc.addTrack(t, stream));
+        const sender = pc.getSenders().find(s => s.track?.kind === 'video');
+
+        if (sender) {
+          await sender.replaceTrack(videoTrack);
+        } else {
+          pc.addTrack(videoTrack, stream);
+        }
+
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
         socket.emit('webrtc:signal', {
@@ -311,12 +436,21 @@ export function useMediaChat(
     }
   };
 
+  // Clean up all peers, audio elements, and media tracks on unmount
   useEffect(() => {
     return () => {
       localAudioStreamRef.current?.getTracks().forEach(t => t.stop());
       localVideoStreamRef.current?.getTracks().forEach(t => t.stop());
-      peersRef.current.forEach(pc => pc.close());
+      peersRef.current.forEach(pc => {
+        try { pc.close(); } catch {}
+      });
       peersRef.current.clear();
+      candidateQueueRef.current.clear();
+      remoteAudioElementsRef.current.forEach(el => {
+        el.pause();
+        el.srcObject = null;
+      });
+      remoteAudioElementsRef.current.clear();
       if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
       if (audioContextRef.current) audioContextRef.current.close().catch(() => {});
     };

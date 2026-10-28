@@ -36,18 +36,22 @@ export function PlayerVideoStation({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const color = PLAYER_COLORS[player.color];
 
-  // Attach stream to video element
+  // Attach stream to video element with explicit play()
   useEffect(() => {
-    if (videoRef.current && stream) {
-      videoRef.current.srcObject = stream;
-    } else if (videoRef.current && !stream) {
-      videoRef.current.srcObject = null;
+    const video = videoRef.current;
+    if (!video) return;
+
+    if (stream && stream.getVideoTracks().length > 0) {
+      video.srcObject = stream;
+      video.play().catch(() => {});
+    } else {
+      video.srcObject = null;
     }
   }, [stream]);
 
   // Check if stream has an active video track
-  const hasActiveVideo = stream && stream.getVideoTracks().some(t => t.readyState === 'live' && t.enabled);
-  const isCameraActive = isMe ? !!cameraEnabled : (!!isRemoteCameraOn || !!hasActiveVideo);
+  const hasActiveVideo = Boolean(stream && stream.getVideoTracks().some(t => t.readyState === 'live' && t.enabled));
+  const isCameraActive = isMe ? !!cameraEnabled : (!!isRemoteCameraOn || hasActiveVideo);
 
   return (
     <div
@@ -79,7 +83,7 @@ export function PlayerVideoStation({
             ref={videoRef}
             autoPlay
             playsInline
-            muted={isMe}
+            muted
             className="w-full h-full object-cover"
           />
         ) : isCameraActive ? (
