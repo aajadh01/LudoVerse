@@ -214,12 +214,15 @@ export function useMediaChat(
       }
 
       if (track.kind === 'audio') {
-        // Use a single dedicated HTMLAudioElement per remote player with echo control
+        // Use a single dedicated HTMLAudioElement per remote player attached to DOM for iOS/Android compliance
         let audioEl = remoteAudioElementsRef.current.get(targetPlayerId);
         if (!audioEl) {
-          audioEl = new Audio();
+          audioEl = document.createElement('audio');
           audioEl.autoplay = true;
-          audioEl.volume = 1.0;
+          // @ts-expect-error - playsInline is required for iOS WebKit
+          audioEl.playsInline = true;
+          audioEl.style.display = 'none';
+          document.body.appendChild(audioEl);
           remoteAudioElementsRef.current.set(targetPlayerId, audioEl);
         }
         audioEl.srcObject = new MediaStream([track]);
@@ -375,9 +378,9 @@ export function useMediaChat(
       // Acoustic Echo Cancellation, Noise Suppression, and Auto Gain Control prevent speaker loopback!
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
-          echoCancellation: { ideal: true },
-          noiseSuppression: { ideal: true },
-          autoGainControl: { ideal: true },
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
         },
         video: false,
       });
@@ -552,6 +555,23 @@ export function useMediaChat(
     });
   }, [otherPlayerIds, cameraEnabled, micEnabled, myPlayerId, getOrCreatePeerConnection, roomId, socket]);
 
+  // Auto-unlock audio playback on first user touch / click (mobile Safari & Chrome autoplay policy)
+  useEffect(() => {
+    const unlockAudio = () => {
+      remoteAudioElementsRef.current.forEach(audioEl => {
+        if (audioEl.paused && audioEl.srcObject) {
+          audioEl.play().catch(() => {});
+        }
+      });
+    };
+    window.addEventListener('click', unlockAudio, { passive: true });
+    window.addEventListener('touchstart', unlockAudio, { passive: true });
+    return () => {
+      window.removeEventListener('click', unlockAudio);
+      window.removeEventListener('touchstart', unlockAudio);
+    };
+  }, []);
+
   // Clean up all peers, audio elements, and media tracks on unmount
   useEffect(() => {
     return () => {
@@ -565,6 +585,9 @@ export function useMediaChat(
       remoteAudioElementsRef.current.forEach(el => {
         el.pause();
         el.srcObject = null;
+        if (el.parentNode) {
+          el.parentNode.removeChild(el);
+        }
       });
       remoteAudioElementsRef.current.clear();
       if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
