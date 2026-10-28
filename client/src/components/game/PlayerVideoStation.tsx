@@ -70,8 +70,12 @@ export function PlayerVideoStation({
   }, [stream]);
 
   // Check if stream has an active video track
-  const hasActiveVideo = Boolean(stream && stream.getVideoTracks().some(t => t.readyState === 'live' && t.enabled));
-  const isCameraActive = isMe ? !!cameraEnabled : (!!isRemoteCameraOn || hasActiveVideo);
+  const hasActiveVideo = Boolean(
+    stream &&
+    stream.getVideoTracks().some(t => t.readyState === 'live' && (isMe ? t.enabled : !t.muted))
+  );
+  const isCameraActive = isMe ? !!cameraEnabled : !!isRemoteCameraOn;
+  const isRenderingLive = isVideoPlaying && (isMe ? hasActiveVideo : true);
 
   return (
     <div
@@ -111,16 +115,24 @@ export function PlayerVideoStation({
           onError={() => setIsVideoPlaying(false)}
           className={cn(
             "w-full h-full object-cover transition-opacity duration-300",
-            isVideoPlaying && hasActiveVideo ? "opacity-100 relative z-10" : "opacity-0 absolute inset-0 pointer-events-none"
+            isRenderingLive ? "opacity-100 relative z-10" : "opacity-0 absolute inset-0 pointer-events-none"
           )}
         />
 
         {/* Underneath Shield: Active until decoded frames are actively playing */}
-        {(!isVideoPlaying || !hasActiveVideo) && (
+        {!isRenderingLive && (
           isCameraActive ? (
             <div className="w-full h-full flex flex-col items-center justify-center gap-1 bg-[#0D2147] text-white">
-              <Loader2 size={18} className="animate-spin text-emerald-400" />
-              <span className="text-[9px] text-emerald-300 font-bold">Cam Live</span>
+              <div
+                className="w-10 h-10 rounded-full flex items-center justify-center text-sm font-black shadow-md border border-white/60"
+                style={{ backgroundColor: color.hex, color: '#FFFFFF' }}
+              >
+                {player.name.slice(0, 2).toUpperCase()}
+              </div>
+              <div className="flex items-center gap-1">
+                <Loader2 size={14} className="animate-spin text-[#FFC928]" />
+                <span className="text-[8px] text-[#FFC928] font-bold uppercase tracking-wider">Connecting</span>
+              </div>
             </div>
           ) : (
             <div
@@ -142,13 +154,18 @@ export function PlayerVideoStation({
           )
         )}
 
-        {/* Live Camera indicator badge */}
-        {isCameraActive && (
-          <div className="absolute top-1 right-1 flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-emerald-600/90 text-white text-[8px] font-black uppercase shadow">
+        {/* Camera status badge: LIVE only when rendering frames, CONNECTING while establishing */}
+        {isRenderingLive ? (
+          <div className="absolute top-1 right-1 flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-emerald-600/90 text-white text-[8px] font-black uppercase shadow z-20">
             <span className="w-1.5 h-1.5 rounded-full bg-white animate-pulse" />
             Live
           </div>
-        )}
+        ) : isCameraActive ? (
+          <div className="absolute top-1 right-1 flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-amber-500/90 text-[#04153B] text-[8px] font-black uppercase shadow z-20">
+            <span className="w-1.5 h-1.5 rounded-full bg-[#04153B] animate-ping" />
+            Connecting
+          </div>
+        ) : null}
 
         {/* Live Speaking indicator overlay */}
         {isSpeaking && (

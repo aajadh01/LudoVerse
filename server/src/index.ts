@@ -9,6 +9,7 @@ import { ClientToServerEvents, ServerToClientEvents } from '@ludoverse/shared';
 import { RoomManager } from './rooms/RoomManager.js';
 import { registerSocketHandlers } from './sockets/gameHandlers.js';
 import { connectDB, getRecentMatches } from './db/connection.js';
+import { getWebRtcConfig } from './webrtc/iceConfig.js';
 
 const clientDistPath = fs.existsSync(path.resolve(process.cwd(), 'client/dist'))
   ? path.resolve(process.cwd(), 'client/dist')
@@ -33,6 +34,15 @@ app.use(express.json());
 
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', ts: Date.now() });
+});
+
+app.get('/api/webrtc/config', async (_req, res) => {
+  try {
+    const config = await getWebRtcConfig();
+    res.json(config);
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
 });
 
 app.get('/api/matches', async (_req, res) => {

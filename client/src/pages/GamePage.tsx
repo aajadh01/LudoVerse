@@ -100,9 +100,15 @@ export default function GamePage() {
     }
   }, [gameState, joinRoom, roomId]);
 
+  const otherPlayerIdsKey = (gameState?.players ?? [])
+    .filter((p) => p.id !== playerId && p.isConnected)
+    .map((p) => p.id)
+    .sort()
+    .join(',');
+
   const otherPlayerIds = useMemo(() => {
-    return (gameState?.players ?? []).filter((p) => p.id !== playerId && p.isConnected).map((p) => p.id);
-  }, [gameState?.players, playerId]);
+    return otherPlayerIdsKey ? otherPlayerIdsKey.split(',') : [];
+  }, [otherPlayerIdsKey]);
 
   const {
     micEnabled,
@@ -290,6 +296,14 @@ export default function GamePage() {
         <div className="flex items-center justify-center gap-2 py-1.5 bg-red-600/90 text-white text-xs font-bold z-50 shrink-0">
           <WifiOff size={14} className="animate-pulse" />
           <span>Connection interrupted — reconnecting to room…</span>
+        </div>
+      )}
+
+      {/* ── Media Alert Banner (Permissions / Network) ── */}
+      {mediaError && (
+        <div className="flex items-center justify-center gap-2 py-1.5 px-3 bg-amber-500 text-[#002868] text-xs font-black z-50 shrink-0 shadow-md">
+          <AlertCircle size={14} />
+          <span>{mediaError}</span>
         </div>
       )}
 

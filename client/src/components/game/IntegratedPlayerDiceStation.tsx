@@ -59,8 +59,12 @@ export function IntegratedPlayerDiceStation({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const color = PLAYER_COLORS[player.color] || PLAYER_COLORS.red;
 
-  const hasActiveVideo = Boolean(stream && stream.getVideoTracks().some((t) => t.readyState === 'live' && t.enabled));
-  const isCameraActive = isMe ? !!cameraEnabled : !!isRemoteCameraOn || hasActiveVideo;
+  const hasActiveVideo = Boolean(
+    stream &&
+    stream.getVideoTracks().some((t) => t.readyState === 'live' && (isMe ? t.enabled : !t.muted))
+  );
+  const isCameraActive = isMe ? !!cameraEnabled : !!isRemoteCameraOn;
+  const isRenderingLive = isVideoPlaying && (isMe ? hasActiveVideo : true);
 
   // Callback ref guarantees that the video element attaches srcObject the moment it mounts or when stream updates
   const setVideoRef = useCallback((el: HTMLVideoElement | null) => {
@@ -147,16 +151,24 @@ export function IntegratedPlayerDiceStation({
             onError={() => setIsVideoPlaying(false)}
             className={cn(
               "w-full h-full object-cover transition-opacity duration-300",
-              isVideoPlaying && hasActiveVideo ? "opacity-100 relative z-10" : "opacity-0 absolute inset-0 pointer-events-none"
+              isRenderingLive ? "opacity-100 relative z-10" : "opacity-0 absolute inset-0 pointer-events-none"
             )}
           />
 
           {/* Underneath Shield: Active until decoded frames are actively playing */}
-          {(!isVideoPlaying || !hasActiveVideo) && (
+          {!isRenderingLive && (
             isCameraActive ? (
-              <div className="w-full h-full flex flex-col items-center justify-center gap-1 bg-[#0A1E40] text-emerald-300">
-                <Loader2 size={16} className="animate-spin text-emerald-400" />
-                <span className="text-[8px] font-black uppercase tracking-wider">Live</span>
+              <div className="w-full h-full flex flex-col items-center justify-center gap-1 bg-[#0A1E40] text-sky-200">
+                <div
+                  className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-black shadow-md border border-white/60"
+                  style={{ backgroundColor: color.hex, color: '#FFFFFF' }}
+                >
+                  {player.name.slice(0, 2).toUpperCase()}
+                </div>
+                <div className="flex items-center gap-1">
+                  <Loader2 size={12} className="animate-spin text-[#FFC928]" />
+                  <span className="text-[7px] font-bold uppercase tracking-wider text-[#FFC928]">Connecting</span>
+                </div>
               </div>
             ) : (
               <div
@@ -173,13 +185,18 @@ export function IntegratedPlayerDiceStation({
             )
           )}
 
-          {/* Camera live badge */}
-          {isCameraActive && (
-            <div className="absolute top-1 right-1 flex items-center gap-1 px-1 py-0.2 rounded-full bg-emerald-600 text-white text-[7px] font-black uppercase shadow">
+          {/* Camera status badge: LIVE only when rendering frames, CONNECTING while establishing */}
+          {isRenderingLive ? (
+            <div className="absolute top-1 right-1 flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-emerald-600 text-white text-[7px] font-black uppercase shadow z-20">
               <span className="w-1 h-1 rounded-full bg-white animate-pulse" />
-              Cam
+              Live
             </div>
-          )}
+          ) : isCameraActive ? (
+            <div className="absolute top-1 right-1 flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-amber-500/90 text-[#04153B] text-[7px] font-black uppercase shadow z-20">
+              <span className="w-1 h-1 rounded-full bg-[#04153B] animate-ping" />
+              Connecting
+            </div>
+          ) : null}
 
           {/* Speaking ping indicator */}
           {isSpeaking && (
